@@ -635,11 +635,17 @@ type Session struct {
 	Note string `json:"note"`
 }
 
+type Combatant struct {
+	Name       string `json:"name"`
+	Initiative int    `json:"initiative"`
+}
+
 type Campaign struct {
-	Name     string    `json:"name"`
-	General  string    `json:"general"`
-	Players  []Player  `json:"players"`
-	Sessions []Session `json:"sessions"`
+	Name       string       `json:"name"`
+	General    string       `json:"general"`
+	Players    []Player     `json:"players"`
+	Sessions   []Session    `json:"sessions"`
+	Initiative []Combatant  `json:"initiative,omitempty"`
 }
 
 type CampaignData struct {
@@ -718,6 +724,16 @@ type model struct {
 	campRenaming    bool
 	campRenameInput string
 	ta              textarea.Model
+
+	// initiative tracker
+	showInitiative bool
+	initCampIdx    int
+	initCursor     int
+	initTurn       int
+	initAdding     bool
+	initAddPhase   int    // 0=name, 1=initiative number
+	initAddName    string
+	initAddInput   string
 
 	// file watching
 	fileMod      time.Time
@@ -866,6 +882,130 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyMsg:
 		if m.mode == campaignView {
+			// ── initiative tracker ────────────────────────────────
+			if m.showInitiative {
+				init := m.campaign.Campaigns[m.initCampIdx].Initiative
+				if m.initAdding {
+					switch msg.String() {
+					case "ctrl+c":
+						return m, tea.Quit
+					case "esc":
+						m.initAdding = false
+						m.initAddInput = ""
+						m.initAddName = ""
+						m.initAddPhase = 0
+					case "enter":
+						if m.initAddPhase == 0 {
+							m.initAddName = strings.TrimSpace(m.initAddInput)
+							if m.initAddName == "" {
+								m.initAdding = false
+							} else {
+								m.initAddPhase = 1
+								m.initAddInput = ""
+							}
+						} else {
+							val := 0
+							fmt.Sscanf(strings.TrimSpace(m.initAddInput), "%d", &val)
+							c := Combatant{Name: m.initAddName, Initiative: val}
+							m.campaign.Campaigns[m.initCampIdx].Initiative = append(
+								m.campaign.Campaigns[m.initCampIdx].Initiative, c)
+							m.sortInitiative()
+							m.saveCampaign()
+							// find cursor position of new entry
+							for i, com := range m.campaign.Campaigns[m.initCampIdx].Initiative {
+								if com.Name == c.Name && com.Initiative == c.Initiative {
+									m.initCursor = i
+									break
+								}
+							}
+							m.initAdding = false
+							m.initAddInput = ""
+							m.initAddName = ""
+							m.initAddPhase = 0
+						}
+					case "backspace":
+						if len(m.initAddInput) > 0 {
+							runes := []rune(m.initAddInput)
+							m.initAddInput = string(runes[:len(runes)-1])
+						}
+					default:
+						if len(msg.Runes) == 1 {
+							m.initAddInput += string(msg.Runes)
+						}
+					}
+					return m, nil
+				}
+				// not adding
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "tab":
+					m.showInitiative = false
+					m.mode = worldView
+					return m, nil
+				case "esc", "i":
+					m.showInitiative = false
+					return m, nil
+				case "j", "down":
+					if m.initCursor < len(init)-1 {
+						m.initCursor++
+					}
+				case "k", "up":
+					if m.initCursor > 0 {
+						m.initCursor--
+					}
+				case "n", " ":
+					if len(init) > 0 {
+						m.initTurn = (m.initTurn + 1) % len(init)
+					}
+				case "p":
+					if len(init) > 0 {
+						m.initTurn = (m.initTurn - 1 + len(init)) % len(init)
+					}
+				case "r":
+					m.initTurn = 0
+				case "a":
+					m.initAdding = true
+					m.initAddPhase = 0
+					m.initAddInput = ""
+					m.initAddName = ""
+				case "d":
+					if len(init) > 0 {
+						ci := m.initCampIdx
+						idx := m.initCursor
+						m.campaign.Campaigns[ci].Initiative = append(init[:idx], init[idx+1:]...)
+						m.saveCampaign()
+						if m.initCursor >= len(m.campaign.Campaigns[ci].Initiative) {
+							m.initCursor = len(m.campaign.Campaigns[ci].Initiative) - 1
+						}
+						if m.initCursor < 0 {
+							m.initCursor = 0
+						}
+						if m.initTurn >= len(m.campaign.Campaigns[ci].Initiative) {
+							m.initTurn = 0
+						}
+					}
+				case "+", "=":
+					if len(init) > 0 {
+						m.campaign.Campaigns[m.initCampIdx].Initiative[m.initCursor].Initiative++
+						m.sortInitiative()
+						m.saveCampaign()
+					}
+				case "-":
+					if len(init) > 0 {
+						m.campaign.Campaigns[m.initCampIdx].Initiative[m.initCursor].Initiative--
+						m.sortInitiative()
+						m.saveCampaign()
+					}
+				case "X":
+					m.campaign.Campaigns[m.initCampIdx].Initiative = nil
+					m.initCursor = 0
+					m.initTurn = 0
+					m.saveCampaign()
+				}
+				return m, nil
+			}
+
 			// ── confirm-delete state ──────────────────────────────
 			if m.campConfirm {
 				switch msg.String() {
@@ -1125,6 +1265,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.campAddKind = campKindPlayer
 					m.campAdding = true
 					m.campAddInput = ""
+				}
+			case "i":
+				item := m.campCurrentItem()
+				if item != nil {
+					m.initCampIdx = item.campIdx
+					m.initCursor = 0
+					m.showInitiative = true
 				}
 			case "c":
 				m.campAddKind = campKindCampaign
@@ -1935,7 +2082,7 @@ func (m model) viewCampaign() string {
 		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") +
 			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campAddInput) + cur
 	} else {
-		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  c=kampagne  r=omdøb  d=slet")
+		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  c=kampagne  i=initiative  r=omdøb  d=slet")
 	}
 	searchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(hintText)
 	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(sBorderNormal)).Render(strings.Repeat("─", m.width))
@@ -1980,6 +2127,122 @@ func (m model) viewCampaign() string {
 
 	// Content pane
 	contentW := m.width - sideW - 1
+
+	// ── Initiative tracker overlay ────────────────────────────
+	if m.showInitiative {
+		camp := m.campaign.Campaigns[m.initCampIdx]
+		initList := camp.Initiative
+		iTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("⚔  Initiative — " + camp.Name)
+		iHint := sDim.Render("Esc=luk")
+		iGap := contentW - lipgloss.Width(iTitle) - lipgloss.Width(iHint) - 4
+		if iGap < 0 {
+			iGap = 0
+		}
+		iHeader := lipgloss.NewStyle().
+			Border(lipgloss.NormalBorder(), false, false, true, false).
+			BorderForeground(colorGold).Width(contentW).Padding(0, 1).
+			Render(iTitle + strings.Repeat(" ", iGap) + iHint)
+
+		var iBody string
+		if m.initAdding {
+			// handled in hint bar, body shows existing list
+		}
+		var iLines []string
+		iLines = append(iLines, "")
+		if len(initList) == 0 {
+			iLines = append(iLines, "  "+sDim.Render("Tom liste — tryk 'a' for at tilføje combatants"))
+		} else {
+			turnLabel := lipgloss.NewStyle().Background(colorGold).Foreground(colorBg).Bold(true).
+				Render(fmt.Sprintf(" Tur %d/%d ", m.initTurn+1, len(initList)))
+			iLines = append(iLines, "  "+turnLabel)
+			iLines = append(iLines, "")
+			for idx, c := range initList {
+				num := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("%2d. ", idx+1))
+				initVal := lipgloss.NewStyle().Background(colorFaint).Foreground(colorBlue).Bold(true).
+					Padding(0, 1).Render(fmt.Sprintf("%d", c.Initiative))
+				name := lipgloss.NewStyle().Foreground(colorBright).Render(c.Name)
+				var line string
+				if idx == m.initTurn && idx == m.initCursor {
+					arrow := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("▶ ")
+					nameSt := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render(c.Name)
+					line = "  " + num + arrow + initVal + "  " + nameSt + lipgloss.NewStyle().Foreground(colorGold).Render(" ← aktiv tur")
+				} else if idx == m.initTurn {
+					nameSt := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render(c.Name)
+					line = "  " + num + lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("▶ ") + initVal + "  " + nameSt
+				} else if idx == m.initCursor {
+					arrow := lipgloss.NewStyle().Foreground(colorAccent).Render("› ")
+					line = "  " + num + arrow + initVal + "  " + name
+				} else {
+					line = "  " + num + "  " + initVal + "  " + name
+				}
+				iLines = append(iLines, line)
+			}
+		}
+		iBody = strings.Join(iLines, "\n")
+
+		// Hint bar override for initiative
+		var initHint string
+		if m.initAdding {
+			if m.initAddPhase == 0 {
+				cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+				initHint = lipgloss.NewStyle().Foreground(colorGold).Render("Navn: ") +
+					lipgloss.NewStyle().Foreground(colorSelFg).Render(m.initAddInput) + cur
+			} else {
+				cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+				initHint = lipgloss.NewStyle().Foreground(colorGold).Render("Initiative for "+m.initAddName+": ") +
+					lipgloss.NewStyle().Foreground(colorSelFg).Render(m.initAddInput) + cur
+			}
+		} else {
+			initHint = sDim.Render("n/Space=næste  p=forrige  r=top  a=tilføj  d=slet  +=op  -=ned  X=ryd  Esc=luk")
+		}
+		iSearchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(initHint)
+		iBorderLine := lipgloss.NewStyle().Foreground(colorGold).Render(strings.Repeat("─", m.width))
+		iSearchBar := iSearchLine + "\n" + iBorderLine
+
+		// Status bar
+		var iKeys [][]string
+		if m.initAdding {
+			iKeys = [][]string{{"Enter", "bekræft"}, {"Esc", "annuller"}}
+		} else {
+			iKeys = [][]string{{"n Space", "næste tur"}, {"p", "forrige"}, {"r", "top"}, {"a", "tilføj"}, {"d", "slet"}, {"+/-", "justér"}, {"X", "ryd"}, {"Esc", "luk"}}
+		}
+		var iKeyParts []string
+		for _, k := range iKeys {
+			iKeyParts = append(iKeyParts, sKey.Render(k[0])+" "+sDim.Render(k[1]))
+		}
+		iStatusBar := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(strings.Join(iKeyParts, "  "))
+
+		// Combine sidebar + initiative content
+		dividerI := lipgloss.NewStyle().Foreground(colorGold).Render("│")
+		iSideAll := append([]string{sideHeader}, sideLines...)
+		iContAll := append([]string{iHeader}, strings.Split(iBody, "\n")...)
+		iTotalLines := vis + 1
+		for len(iSideAll) < iTotalLines {
+			iSideAll = append(iSideAll, "")
+		}
+		for len(iContAll) < iTotalLines {
+			iContAll = append(iContAll, "")
+		}
+		var iMainLines []string
+		for i := 0; i < iTotalLines; i++ {
+			sl := ""
+			if i < len(iSideAll) {
+				sl = iSideAll[i]
+			}
+			cl := ""
+			if i < len(iContAll) {
+				cl = iContAll[i]
+			}
+			vl := visLen(sl)
+			if vl < sideW {
+				pad := lipgloss.NewStyle().Background(colorSideBg).Render(strings.Repeat(" ", sideW-vl))
+				sl = sl + pad
+			}
+			iMainLines = append(iMainLines, sl+dividerI+cl)
+		}
+		return header + "\n" + iSearchBar + "\n" + strings.Join(iMainLines, "\n") + "\n" + iStatusBar
+	}
+
 	item := m.campCurrentItem()
 	var nbTitle string
 	var canEdit bool
@@ -2109,7 +2372,7 @@ func (m model) viewCampaign() string {
 	} else if m.campEditing {
 		keys = [][]string{{"Enter", "gem & luk"}, {"Esc", "gem & luk"}}
 	} else {
-		keys = [][]string{{"↑↓ jk", "naviger"}, {"→ ←", "fold"}, {"Enter", "åbn/rediger"}, {"a", "spiller"}, {"s", "session"}, {"c", "kampagne"}, {"r", "omdøb"}, {"d", "slet"}, {"Tab", "verden"}}
+		keys = [][]string{{"↑↓ jk", "naviger"}, {"→ ←", "fold"}, {"Enter", "åbn/rediger"}, {"a", "spiller"}, {"s", "session"}, {"c", "kampagne"}, {"i", "initiative"}, {"r", "omdøb"}, {"d", "slet"}, {"Tab", "verden"}}
 	}
 	var keyParts []string
 	for _, k := range keys {
@@ -2267,6 +2530,40 @@ func (m *model) campSetNote(val string) {
 		m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Note = val
 	case campKindSession:
 		m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Note = val
+	}
+}
+
+func (m *model) sortInitiative() {
+	list := m.campaign.Campaigns[m.initCampIdx].Initiative
+	if len(list) == 0 {
+		return
+	}
+	// Remember current turn combatant name to re-find after sort
+	var turnName string
+	if m.initTurn < len(list) {
+		turnName = list[m.initTurn].Name
+	}
+	var cursorName string
+	if m.initCursor < len(list) {
+		cursorName = list[m.initCursor].Name
+	}
+	// Bubble sort descending by initiative
+	for i := 0; i < len(list)-1; i++ {
+		for j := 0; j < len(list)-1-i; j++ {
+			if list[j].Initiative < list[j+1].Initiative {
+				list[j], list[j+1] = list[j+1], list[j]
+			}
+		}
+	}
+	m.campaign.Campaigns[m.initCampIdx].Initiative = list
+	// Restore turn and cursor positions
+	for i, c := range list {
+		if c.Name == turnName {
+			m.initTurn = i
+		}
+		if c.Name == cursorName {
+			m.initCursor = i
+		}
 	}
 }
 
