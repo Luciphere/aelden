@@ -725,6 +725,12 @@ type model struct {
 	campRenameInput string
 	ta              textarea.Model
 
+	// campaign reference picker
+	campRefPicking bool
+	campRefInsert  bool   // true=insert into textarea, false=follow to world view
+	campRefSearch  string
+	campRefCursor  int
+
 	// initiative tracker
 	showInitiative bool
 	initCampIdx    int
@@ -1006,6 +1012,54 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// ── reference picker ─────────────────────────────────
+			if m.campRefPicking {
+				filtered := m.campRefFiltered()
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "esc":
+					m.campRefPicking = false
+					m.campRefSearch = ""
+				case "enter":
+					if m.campRefCursor < len(filtered) {
+						r := filtered[m.campRefCursor]
+						if m.campRefInsert {
+							m.ta.SetValue(m.ta.Value() + "[" + r.Name + "]")
+						} else {
+							m.campRefPicking = false
+							m.campRefSearch = ""
+							m.mode = worldView
+							m.openByID(r.ID, true)
+						}
+						if m.campRefInsert {
+							m.campRefPicking = false
+							m.campRefSearch = ""
+						}
+					}
+				case "up", "k":
+					if m.campRefCursor > 0 {
+						m.campRefCursor--
+					}
+				case "down", "j":
+					if m.campRefCursor < len(filtered)-1 {
+						m.campRefCursor++
+					}
+				case "backspace":
+					if len(m.campRefSearch) > 0 {
+						runes := []rune(m.campRefSearch)
+						m.campRefSearch = string(runes[:len(runes)-1])
+						m.campRefCursor = 0
+					}
+				default:
+					if len(msg.Runes) == 1 {
+						m.campRefSearch += string(msg.Runes)
+						m.campRefCursor = 0
+					}
+				}
+				return m, nil
+			}
+
 			// ── confirm-delete state ──────────────────────────────
 			if m.campConfirm {
 				switch msg.String() {
@@ -1230,6 +1284,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			// ── editing: pass all other keys to textarea ──────────
 			if m.campEditing {
+				if msg.String() == "ctrl+r" {
+					m.campRefPicking = true
+					m.campRefInsert = true
+					m.campRefSearch = ""
+					m.campRefCursor = 0
+					return m, nil
+				}
 				var cmd tea.Cmd
 				m.ta, cmd = m.ta.Update(msg)
 				cmds = append(cmds, cmd)
@@ -1265,6 +1326,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.campAddKind = campKindPlayer
 					m.campAdding = true
 					m.campAddInput = ""
+				}
+			case "f":
+				note := m.campCurrentNote()
+				if note != "" {
+					// collect [Name] refs in note that match world articles
+					refs := m.campNoteRefs(note)
+					if len(refs) > 0 {
+						m.campRefPicking = true
+						m.campRefInsert = false
+						m.campRefSearch = ""
+						m.campRefCursor = 0
+					}
 				}
 			case "i":
 				item := m.campCurrentItem()
@@ -2052,7 +2125,17 @@ func (m model) viewCampaign() string {
 
 	// Hint bar
 	var hintText string
-	if m.campConfirm {
+	if m.campRefPicking {
+		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+		if m.campRefInsert {
+			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Søg artikel: ") +
+				lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campRefSearch) + cur +
+				sDim.Render("  Enter=indsæt  Esc=annuller")
+		} else {
+			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Vælg reference: ") +
+				sDim.Render("Enter=åbn i verden  Esc=luk")
+		}
+	} else if m.campConfirm {
 		hintText = lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("Slet? ") +
 			sKey.Render("j") + sDim.Render(" ja  ") +
 			sKey.Render("n / Esc") + sDim.Render(" annuller")
@@ -2082,7 +2165,7 @@ func (m model) viewCampaign() string {
 		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") +
 			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campAddInput) + cur
 	} else {
-		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  c=kampagne  i=initiative  r=omdøb  d=slet")
+		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  c=kampagne  i=initiative  r=omdøb  d=slet  Ctrl+R=indsæt ref (under redigering)")
 	}
 	searchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(hintText)
 	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(sBorderNormal)).Render(strings.Repeat("─", m.width))
@@ -2281,7 +2364,31 @@ func (m model) viewCampaign() string {
 			strings.Repeat(" ", gap) + editHint)
 
 	var contentBody string
-	if m.campConfirm && item != nil {
+	if m.campRefPicking {
+		filtered := m.campRefFiltered()
+		var lines []string
+		lines = append(lines, "")
+		if m.campRefInsert {
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+"  "+sDim.Render("skriv for at søge"))
+		} else {
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Følg reference"))
+		}
+		lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
+		if len(filtered) == 0 {
+			lines = append(lines, "  "+sDim.Render("Ingen resultater"))
+		}
+		for i, r := range filtered {
+			icon := resourceIcon(r.IconGlyph)
+			name := r.Name
+			if i == m.campRefCursor {
+				accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
+				lines = append(lines, "  "+accent+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(icon+name))
+			} else {
+				lines = append(lines, "    "+lipgloss.NewStyle().Foreground(colorAccent).Render(icon+name))
+			}
+		}
+		contentBody = strings.Join(lines, "\n")
+	} else if m.campConfirm && item != nil {
 		var what string
 		switch item.kind {
 		case campKindCampaign:
@@ -2325,11 +2432,17 @@ func (m model) viewCampaign() string {
 		if note == "" {
 			contentBody = "\n  " + sDim.Render("Ingen noter endnu — tryk Enter for at begynde.")
 		} else {
+			hasRefs := len(m.campNoteRefs(note)) > 0
 			var lines []string
 			for _, l := range strings.Split(note, "\n") {
-				lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorBright).Render(l))
+				rendered := "  " + applyInlineStyles(highlightMentions(l))
+				lines = append(lines, rendered)
 			}
-			contentBody = "\n" + strings.Join(lines, "\n")
+			body := "\n" + strings.Join(lines, "\n")
+			if hasRefs {
+				body += "\n\n  " + sDim.Render("f") + sDim.Render(" = følg reference")
+			}
+			contentBody = body
 		}
 	}
 
@@ -2531,6 +2644,61 @@ func (m *model) campSetNote(val string) {
 	case campKindSession:
 		m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Note = val
 	}
+}
+
+func (m *model) campRefFiltered() []Resource {
+	q := strings.ToLower(m.campRefSearch)
+	var out []Resource
+	if m.campRefInsert {
+		// search all resources by name
+		for _, r := range m.resources {
+			if q == "" || strings.Contains(strings.ToLower(r.Name), q) {
+				out = append(out, r)
+			}
+			if len(out) >= 50 {
+				break
+			}
+		}
+	} else {
+		// only refs found in the current note
+		note := m.campCurrentNote()
+		refs := m.campNoteRefs(note)
+		for _, r := range refs {
+			if q == "" || strings.Contains(strings.ToLower(r.Name), q) {
+				out = append(out, r)
+			}
+		}
+	}
+	return out
+}
+
+func (m *model) campNoteRefs(note string) []Resource {
+	var out []Resource
+	seen := map[string]bool{}
+	remaining := note
+	for {
+		start := strings.Index(remaining, "[")
+		if start == -1 {
+			break
+		}
+		end := strings.Index(remaining[start:], "]")
+		if end == -1 {
+			break
+		}
+		name := remaining[start+1 : start+end]
+		remaining = remaining[start+end+1:]
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		for i := range m.resources {
+			if strings.EqualFold(m.resources[i].Name, name) {
+				out = append(out, m.resources[i])
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (m *model) sortInitiative() {
