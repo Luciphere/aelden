@@ -2725,14 +2725,9 @@ func (m *model) campRefFiltered() []Resource {
 			}
 		}
 	} else {
-		// only refs found in the current note
+		// follow mode: show all note refs, digit buffer is not a text filter
 		note := m.campCurrentNote()
-		refs := m.campNoteRefs(note)
-		for _, r := range refs {
-			if q == "" || strings.Contains(strings.ToLower(r.Name), q) {
-				out = append(out, r)
-			}
-		}
+		out = m.campNoteRefs(note)
 	}
 	return out
 }
