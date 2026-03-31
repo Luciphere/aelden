@@ -1355,15 +1355,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.campAddInput = ""
 				}
 			case "f":
-				note := m.campCurrentNote()
-				if note != "" {
-					// collect [Name] refs in note that match world articles
-					refs := m.campNoteRefs(note)
-					if len(refs) > 0 {
-						m.campRefPicking = true
-						m.campRefInsert = false
-						m.campRefSearch = ""
-						m.campRefCursor = 0
+				if m.campRefPicking && !m.campRefInsert {
+					m.campRefPicking = false
+					m.campRefSearch = ""
+				} else {
+					note := m.campCurrentNote()
+					if note != "" {
+						refs := m.campNoteRefs(note)
+						if len(refs) > 0 {
+							m.campRefPicking = true
+							m.campRefInsert = false
+							m.campRefSearch = ""
+							m.campRefCursor = 0
+						}
 					}
 				}
 			case "i":
@@ -2692,9 +2696,23 @@ func (m *model) campRefFiltered() []Resource {
 	q := strings.ToLower(m.campRefSearch)
 	var out []Resource
 	if m.campRefInsert {
-		// search all resources by name
+		isTag := strings.HasPrefix(q, "#")
+		tag := strings.TrimPrefix(q, "#")
 		for _, r := range m.resources {
-			if q == "" || strings.Contains(strings.ToLower(r.Name), q) {
+			var match bool
+			if q == "" {
+				match = true
+			} else if isTag {
+				for _, t := range r.Tags {
+					if strings.Contains(strings.ToLower(t), tag) {
+						match = true
+						break
+					}
+				}
+			} else {
+				match = strings.Contains(strings.ToLower(r.Name), q)
+			}
+			if match {
 				out = append(out, r)
 			}
 			if len(out) >= 50 {
