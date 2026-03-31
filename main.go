@@ -726,10 +726,11 @@ type model struct {
 	ta              textarea.Model
 
 	// campaign reference picker
-	campRefPicking bool
-	campRefInsert  bool   // true=insert into textarea, false=follow to world view
-	campRefSearch  string
-	campRefCursor  int
+	campRefPicking   bool
+	campRefInsert    bool   // true=insert into textarea, false=follow to world view
+	campRefSearch    string
+	campRefCursor    int
+	campRefTagFilter string // non-empty = show articles with this tag (phase 2)
 
 	// initiative tracker
 	showInitiative bool
@@ -1015,23 +1016,41 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// ── reference picker ─────────────────────────────────
 			if m.campRefPicking {
 				filtered := m.campRefFiltered()
+				tags := m.campRefMatchingTags()
+				inTagMode := m.campRefInTagMode()
 				switch msg.String() {
 				case "ctrl+c":
 					return m, tea.Quit
 				case "esc":
-					if m.campRefSearch != "" {
+					if m.campRefTagFilter != "" {
+						// go back to tag browsing
+						m.campRefTagFilter = ""
+						m.campRefSearch = "#"
+						m.campRefCursor = 0
+					} else if m.campRefSearch != "" {
 						m.campRefSearch = ""
+						m.campRefCursor = 0
 					} else {
 						m.campRefPicking = false
 					}
 				case "enter":
 					if m.campRefInsert {
-						// insert mode: text search → select by cursor
-						if m.campRefCursor < len(filtered) {
-							m.ta.SetValue(m.ta.Value() + "[" + filtered[m.campRefCursor].Name + "]")
+						if inTagMode {
+							// select a tag → move to article phase
+							if m.campRefCursor < len(tags) {
+								m.campRefTagFilter = tags[m.campRefCursor]
+								m.campRefSearch = ""
+								m.campRefCursor = 0
+							}
+						} else {
+							// insert the selected article
+							if m.campRefCursor < len(filtered) {
+								m.ta.SetValue(m.ta.Value() + "[" + filtered[m.campRefCursor].Name + "]")
+							}
+							m.campRefPicking = false
+							m.campRefSearch = ""
+							m.campRefTagFilter = ""
 						}
-						m.campRefPicking = false
-						m.campRefSearch = ""
 					} else {
 						// follow mode: digit input → jump by number
 						if m.campRefSearch != "" {
@@ -1057,17 +1076,29 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				case "up", "k":
-					if m.campRefInsert {
+					if inTagMode {
+						if m.campRefCursor > 0 {
+							m.campRefCursor--
+						}
+					} else if m.campRefInsert {
 						m.campRefSearch += string(msg.Runes)
 						m.campRefCursor = 0
 					} else if m.campRefCursor > 0 {
 						m.campRefCursor--
 					}
 				case "down", "j":
-					if m.campRefInsert {
+					listLen := len(filtered)
+					if inTagMode {
+						listLen = len(tags)
+					}
+					if inTagMode {
+						if m.campRefCursor < listLen-1 {
+							m.campRefCursor++
+						}
+					} else if m.campRefInsert {
 						m.campRefSearch += string(msg.Runes)
 						m.campRefCursor = 0
-					} else if m.campRefCursor < len(filtered)-1 {
+					} else if m.campRefCursor < listLen-1 {
 						m.campRefCursor++
 					}
 				case "backspace":
@@ -2162,11 +2193,11 @@ func (m model) viewCampaign() string {
 	// Hint bar
 	var hintText string
 	if m.campRefPicking {
-		if m.campRefInsert {
-			cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Søg: ") +
-				lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campRefSearch) + cur +
-				sDim.Render("  ↑↓=naviger  Enter=indsæt  Esc=luk")
+		inTagMode := m.campRefInTagMode()
+		if m.campRefInsert && inTagMode {
+			hintText = sDim.Render("skriv tag-navn  |  ↑↓=naviger  |  Enter=vælg  |  Esc=luk")
+		} else if m.campRefInsert {
+			hintText = sDim.Render("skriv artikelnavn eller #tag  |  ↑↓=naviger  |  Enter=indsæt  |  Esc=luk")
 		} else {
 			hintText = sDim.Render("skriv nr + Enter  |  ↑↓ jk=naviger  |  Esc=luk")
 		}
@@ -2401,19 +2432,30 @@ func (m model) viewCampaign() string {
 	var contentBody string
 	if m.campRefPicking {
 		filtered := m.campRefFiltered()
+		tags := m.campRefMatchingTags()
+		inTagMode := m.campRefInTagMode()
 		var lines []string
 		lines = append(lines, "")
-		// header + input display
-		var inputDisplay string
+		// header
 		if m.campRefInsert {
-			if m.campRefSearch != "" {
-				inputDisplay = "  " + lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Bold(true).Padding(0, 1).Render("filter: "+m.campRefSearch) +
-					lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ") + sDim.Render(" Enter=indsæt")
+			if inTagMode {
+				tagFilter := strings.TrimPrefix(m.campRefSearch, "#")
+				cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+				inputDisplay := "  " + lipgloss.NewStyle().Foreground(colorGold).Render("#") +
+					lipgloss.NewStyle().Foreground(colorSelFg).Render(tagFilter) + cur +
+					sDim.Render("  Enter=vælg tag  Esc=luk")
+				lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Vælg tag")+inputDisplay)
+			} else if m.campRefTagFilter != "" {
+				badge := lipgloss.NewStyle().Background(colorFaint).Foreground(colorBlue).Padding(0, 1).Render("#" + m.campRefTagFilter)
+				lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+"  "+badge+"  "+sDim.Render("Esc=skift tag"))
 			} else {
-				inputDisplay = "  " + sDim.Render("skriv for at søge  |  Esc=luk")
+				cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+				inputDisplay := "  " + lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campRefSearch) + cur +
+					sDim.Render("  Enter=indsæt  Esc=luk")
+				lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+inputDisplay)
 			}
-			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+inputDisplay)
 		} else {
+			var inputDisplay string
 			if m.campRefSearch != "" {
 				inputDisplay = "  " + lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Bold(true).Padding(0, 1).Render("→ "+m.campRefSearch) +
 					lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ") + sDim.Render(" Enter=hop")
@@ -2423,19 +2465,33 @@ func (m model) viewCampaign() string {
 			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Følg reference")+inputDisplay)
 		}
 		lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
-		if len(filtered) == 0 {
-			lines = append(lines, "  "+sDim.Render("Ingen resultater"))
-		}
-		for i, r := range filtered {
-			num := lipgloss.NewStyle().Background(colorFaint).Foreground(colorGold).Bold(true).Padding(0, 1).Render(fmt.Sprintf("%d", i+1))
-			icon := resourceIcon(r.IconGlyph)
-			if i == m.campRefCursor {
-				accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
-				name := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(icon + r.Name)
-				lines = append(lines, "  "+accent+num+" "+name)
-			} else {
-				name := lipgloss.NewStyle().Foreground(colorAccent).Render(icon + r.Name)
-				lines = append(lines, "    "+num+" "+name)
+
+		if inTagMode {
+			if len(tags) == 0 {
+				lines = append(lines, "  "+sDim.Render("Ingen tags fundet"))
+			}
+			for i, t := range tags {
+				pill := sTag.Render("#" + t)
+				if i == m.campRefCursor {
+					accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
+					lines = append(lines, "  "+accent+pill)
+				} else {
+					lines = append(lines, "    "+pill)
+				}
+			}
+		} else {
+			if len(filtered) == 0 {
+				lines = append(lines, "  "+sDim.Render("Ingen resultater"))
+			}
+			for i, r := range filtered {
+				num := lipgloss.NewStyle().Background(colorFaint).Foreground(colorGold).Bold(true).Padding(0, 1).Render(fmt.Sprintf("%d", i+1))
+				icon := resourceIcon(r.IconGlyph)
+				if i == m.campRefCursor {
+					accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
+					lines = append(lines, "  "+accent+num+" "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(icon+r.Name))
+				} else {
+					lines = append(lines, "    "+num+" "+lipgloss.NewStyle().Foreground(colorAccent).Render(icon+r.Name))
+				}
 			}
 		}
 		contentBody = strings.Join(lines, "\n")
@@ -2697,23 +2753,46 @@ func (m *model) campSetNote(val string) {
 	}
 }
 
+func (m *model) campRefInTagMode() bool {
+	return m.campRefInsert && m.campRefTagFilter == "" && strings.HasPrefix(m.campRefSearch, "#")
+}
+
+func (m *model) campRefMatchingTags() []string {
+	q := strings.ToLower(strings.TrimPrefix(m.campRefSearch, "#"))
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range m.resources {
+		for _, t := range r.Tags {
+			tl := strings.ToLower(t)
+			if !seen[tl] && (q == "" || strings.Contains(tl, q)) {
+				seen[tl] = true
+				out = append(out, t)
+			}
+		}
+	}
+	return out
+}
+
 func (m *model) campRefFiltered() []Resource {
 	q := strings.ToLower(m.campRefSearch)
 	var out []Resource
 	if m.campRefInsert {
-		isTag := strings.HasPrefix(q, "#")
-		tag := strings.TrimPrefix(q, "#")
+		if m.campRefInTagMode() {
+			// tag browsing phase — return empty, tags shown separately
+			return nil
+		}
+		// phase 2: filter by selected tag, or by name search
 		for _, r := range m.resources {
 			var match bool
-			if q == "" || (isTag && tag == "") {
-				match = true
-			} else if isTag {
+			if m.campRefTagFilter != "" {
 				for _, t := range r.Tags {
-					if strings.Contains(strings.ToLower(t), tag) {
+					if strings.EqualFold(t, m.campRefTagFilter) {
 						match = true
 						break
 					}
 				}
+			} else if q == "" {
+				match = true
 			} else {
 				match = strings.Contains(strings.ToLower(r.Name), q)
 			}
