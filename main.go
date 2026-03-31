@@ -1019,42 +1019,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "ctrl+c":
 					return m, tea.Quit
 				case "esc":
-					m.campRefPicking = false
-					m.campRefSearch = ""
+					if m.campRefSearch != "" {
+						m.campRefSearch = ""
+					} else {
+						m.campRefPicking = false
+					}
 				case "enter":
-					if m.campRefCursor < len(filtered) {
-						r := filtered[m.campRefCursor]
-						if m.campRefInsert {
-							m.ta.SetValue(m.ta.Value() + "[" + r.Name + "]")
-						} else {
+					if m.campRefInsert {
+						// insert mode: text search → select by cursor
+						if m.campRefCursor < len(filtered) {
+							m.ta.SetValue(m.ta.Value() + "[" + filtered[m.campRefCursor].Name + "]")
+						}
+						m.campRefPicking = false
+						m.campRefSearch = ""
+					} else {
+						// follow mode: digit input → jump by number
+						if m.campRefSearch != "" {
+							idx := 0
+							fmt.Sscanf(m.campRefSearch, "%d", &idx)
+							idx--
+							if idx >= 0 && idx < len(filtered) {
+								m.campRefPicking = false
+								m.campRefSearch = ""
+								m.mode = worldView
+								m.openByID(filtered[idx].ID, true)
+							} else {
+								m.campRefSearch = ""
+							}
+						} else if m.campRefCursor < len(filtered) {
+							r := filtered[m.campRefCursor]
 							m.campRefPicking = false
 							m.campRefSearch = ""
 							m.mode = worldView
 							m.openByID(r.ID, true)
-						}
-						if m.campRefInsert {
+						} else {
 							m.campRefPicking = false
-							m.campRefSearch = ""
 						}
 					}
 				case "up", "k":
-					if m.campRefCursor > 0 {
+					if m.campRefSearch == "" && m.campRefCursor > 0 {
 						m.campRefCursor--
 					}
 				case "down", "j":
-					if m.campRefCursor < len(filtered)-1 {
+					if m.campRefSearch == "" && m.campRefCursor < len(filtered)-1 {
 						m.campRefCursor++
 					}
 				case "backspace":
 					if len(m.campRefSearch) > 0 {
 						runes := []rune(m.campRefSearch)
 						m.campRefSearch = string(runes[:len(runes)-1])
-						m.campRefCursor = 0
+						if m.campRefInsert {
+							m.campRefCursor = 0
+						}
 					}
 				default:
 					if len(msg.Runes) == 1 {
-						m.campRefSearch += string(msg.Runes)
-						m.campRefCursor = 0
+						if m.campRefInsert {
+							// text search for insert mode
+							m.campRefSearch += string(msg.Runes)
+							m.campRefCursor = 0
+						} else if msg.Runes[0] >= '0' && msg.Runes[0] <= '9' {
+							// digit buffer for follow mode
+							m.campRefSearch += string(msg.Runes[0])
+						}
 					}
 				}
 				return m, nil
@@ -2126,14 +2153,13 @@ func (m model) viewCampaign() string {
 	// Hint bar
 	var hintText string
 	if m.campRefPicking {
-		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
 		if m.campRefInsert {
-			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Søg artikel: ") +
+			cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Søg: ") +
 				lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campRefSearch) + cur +
-				sDim.Render("  Enter=indsæt  Esc=annuller")
+				sDim.Render("  ↑↓=naviger  Enter=indsæt  Esc=luk")
 		} else {
-			hintText = lipgloss.NewStyle().Foreground(colorAccent).Render("Vælg reference: ") +
-				sDim.Render("Enter=åbn i verden  Esc=luk")
+			hintText = sDim.Render("skriv nr + Enter  |  ↑↓ jk=naviger  |  Esc=luk")
 		}
 	} else if m.campConfirm {
 		hintText = lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("Slet? ") +
@@ -2368,23 +2394,39 @@ func (m model) viewCampaign() string {
 		filtered := m.campRefFiltered()
 		var lines []string
 		lines = append(lines, "")
+		// header + input display
+		var inputDisplay string
 		if m.campRefInsert {
-			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+"  "+sDim.Render("skriv for at søge"))
+			if m.campRefSearch != "" {
+				inputDisplay = "  " + lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Bold(true).Padding(0, 1).Render("filter: "+m.campRefSearch) +
+					lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ") + sDim.Render(" Enter=indsæt")
+			} else {
+				inputDisplay = "  " + sDim.Render("skriv for at søge  |  Esc=luk")
+			}
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Indsæt reference")+inputDisplay)
 		} else {
-			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Følg reference"))
+			if m.campRefSearch != "" {
+				inputDisplay = "  " + lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Bold(true).Padding(0, 1).Render("→ "+m.campRefSearch) +
+					lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ") + sDim.Render(" Enter=hop")
+			} else {
+				inputDisplay = "  " + sDim.Render("skriv nr + Enter  |  Esc=luk")
+			}
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("↗  Følg reference")+inputDisplay)
 		}
 		lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
 		if len(filtered) == 0 {
 			lines = append(lines, "  "+sDim.Render("Ingen resultater"))
 		}
 		for i, r := range filtered {
+			num := lipgloss.NewStyle().Background(colorFaint).Foreground(colorGold).Bold(true).Padding(0, 1).Render(fmt.Sprintf("%d", i+1))
 			icon := resourceIcon(r.IconGlyph)
-			name := r.Name
 			if i == m.campRefCursor {
 				accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
-				lines = append(lines, "  "+accent+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(icon+name))
+				name := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(icon + r.Name)
+				lines = append(lines, "  "+accent+num+" "+name)
 			} else {
-				lines = append(lines, "    "+lipgloss.NewStyle().Foreground(colorAccent).Render(icon+name))
+				name := lipgloss.NewStyle().Foreground(colorAccent).Render(icon + r.Name)
+				lines = append(lines, "    "+num+" "+name)
 			}
 		}
 		contentBody = strings.Join(lines, "\n")
