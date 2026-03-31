@@ -299,7 +299,7 @@ func flattenTree(idMap map[string]*Resource, children map[string][]string, paren
 	var result []TreeNode
 	for _, rid := range children[parent] {
 		r, ok := idMap[rid]
-		if !ok || r.IsHidden {
+		if !ok {
 			continue
 		}
 		result = append(result, TreeNode{Resource: r, Depth: depth})
@@ -312,7 +312,7 @@ func buildVisibleTree(idMap map[string]*Resource, children map[string][]string, 
 	var result []TreeNode
 	for _, rid := range children[parent] {
 		r, ok := idMap[rid]
-		if !ok || r.IsHidden {
+		if !ok {
 			continue
 		}
 		result = append(result, TreeNode{Resource: r, Depth: depth})
@@ -626,13 +626,15 @@ const (
 )
 
 type Player struct {
-	Name string `json:"name"`
-	Note string `json:"note"`
+	Name  string `json:"name"`
+	Note  string `json:"note"`
+	Blurb string `json:"blurb,omitempty"`
 }
 
 type Session struct {
-	Name string `json:"name"`
-	Note string `json:"note"`
+	Name  string `json:"name"`
+	Note  string `json:"note"`
+	Blurb string `json:"blurb,omitempty"`
 }
 
 type Combatant struct {
@@ -640,12 +642,18 @@ type Combatant struct {
 	Initiative int    `json:"initiative"`
 }
 
+type Task struct {
+	Name string `json:"name"`
+	Done bool   `json:"done"`
+}
+
 type Campaign struct {
-	Name       string       `json:"name"`
-	General    string       `json:"general"`
-	Players    []Player     `json:"players"`
-	Sessions   []Session    `json:"sessions"`
-	Initiative []Combatant  `json:"initiative,omitempty"`
+	Name       string      `json:"name"`
+	General    string      `json:"general"`
+	Players    []Player    `json:"players"`
+	Sessions   []Session   `json:"sessions"`
+	Tasks      []Task      `json:"tasks,omitempty"`
+	Initiative []Combatant `json:"initiative,omitempty"`
 }
 
 type CampaignData struct {
@@ -732,13 +740,23 @@ type model struct {
 	campRefCursor    int
 	campRefTagFilter string // non-empty = show articles with this tag (phase 2)
 
+	// task list
+	campTaskFocus  bool
+	campTaskCursor int
+	campTaskAdding bool
+	campTaskInput  string
+
+	// blurb editing
+	campBlurbEditing bool
+	campBlurbInput   string
+
 	// initiative tracker
 	showInitiative bool
 	initCampIdx    int
 	initCursor     int
 	initTurn       int
 	initAdding     bool
-	initAddPhase   int    // 0=name, 1=initiative number
+	initAddPhase   int // 0=name, 1=initiative number
 	initAddName    string
 	initAddInput   string
 
@@ -1306,9 +1324,127 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// ── task adding ───────────────────────────────────────
+			if m.campTaskAdding {
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "esc":
+					m.campTaskAdding = false
+					m.campTaskInput = ""
+				case "enter":
+					name := strings.TrimSpace(m.campTaskInput)
+					if name != "" {
+						item := m.campCurrentItem()
+						ci := 0
+						if item != nil {
+							ci = item.campIdx
+						}
+						m.campaign.Campaigns[ci].Tasks = append(
+							m.campaign.Campaigns[ci].Tasks, Task{Name: name},
+						)
+						m.saveCampaign()
+						m.campTaskCursor = len(m.campaign.Campaigns[ci].Tasks) - 1
+						m.campTaskFocus = true
+					}
+					m.campTaskAdding = false
+					m.campTaskInput = ""
+				case "backspace":
+					if len(m.campTaskInput) > 0 {
+						runes := []rune(m.campTaskInput)
+						m.campTaskInput = string(runes[:len(runes)-1])
+					}
+				default:
+					if len(msg.Runes) == 1 {
+						m.campTaskInput += string(msg.Runes)
+					}
+				}
+				return m, nil
+			}
+
+			// ── blurb editing ─────────────────────────────────────
+			if m.campBlurbEditing {
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "esc":
+					m.campBlurbEditing = false
+					m.campBlurbInput = ""
+				case "enter":
+					item := m.campCurrentItem()
+					if item != nil {
+						switch item.kind {
+						case campKindPlayer:
+							m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb = m.campBlurbInput
+						case campKindSession:
+							m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb = m.campBlurbInput
+						}
+						m.saveCampaign()
+					}
+					m.campBlurbEditing = false
+					m.campBlurbInput = ""
+				case "backspace":
+					if len(m.campBlurbInput) > 0 {
+						runes := []rune(m.campBlurbInput)
+						m.campBlurbInput = string(runes[:len(runes)-1])
+					}
+				default:
+					if len(msg.Runes) == 1 {
+						m.campBlurbInput += string(msg.Runes)
+					}
+				}
+				return m, nil
+			}
+
+			// ── task focus ────────────────────────────────────────
+			if m.campTaskFocus {
+				item := m.campCurrentItem()
+				ci := 0
+				if item != nil {
+					ci = item.campIdx
+				}
+				tasks := m.campaign.Campaigns[ci].Tasks
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "esc":
+					m.campTaskFocus = false
+				case "j", "down":
+					if m.campTaskCursor < len(tasks)-1 {
+						m.campTaskCursor++
+					}
+				case "k", "up":
+					if m.campTaskCursor > 0 {
+						m.campTaskCursor--
+					}
+				case " ", "enter":
+					if m.campTaskCursor < len(tasks) {
+						m.campaign.Campaigns[ci].Tasks[m.campTaskCursor].Done = !m.campaign.Campaigns[ci].Tasks[m.campTaskCursor].Done
+						m.saveCampaign()
+					}
+				case "d":
+					if m.campTaskCursor < len(tasks) {
+						t := m.campaign.Campaigns[ci].Tasks
+						m.campaign.Campaigns[ci].Tasks = append(t[:m.campTaskCursor], t[m.campTaskCursor+1:]...)
+						m.saveCampaign()
+						if m.campTaskCursor >= len(m.campaign.Campaigns[ci].Tasks) {
+							m.campTaskCursor = len(m.campaign.Campaigns[ci].Tasks) - 1
+						}
+						if m.campTaskCursor < 0 {
+							m.campTaskCursor = 0
+						}
+					}
+				case "t":
+					m.campTaskFocus = false
+					m.campTaskAdding = true
+					m.campTaskInput = ""
+				}
+				return m, nil
+			}
+
 			// ── global keys (work even while editing) ─────────────
 			switch msg.String() {
-			case "ctrl+c":
+			case "ctrl+c", "q":
 				return m, tea.Quit
 			case "tab":
 				if m.campEditing {
@@ -1334,12 +1470,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				switch item.kind {
 				case campKindCampaign:
-					m.campExpanded[item.campIdx] = !m.campExpanded[item.campIdx]
-					m.buildCampItems()
-					if m.campCursor >= len(m.campItems) {
-						m.campCursor = len(m.campItems) - 1
+					if !m.campExpanded[item.campIdx] {
+						m.campExpanded[item.campIdx] = true
+						m.buildCampItems()
+						if m.campCursor >= len(m.campItems) {
+							m.campCursor = len(m.campItems) - 1
+						}
+					} else {
+						m.campTaskFocus = true
+						m.campTaskCursor = 0
 					}
-				case campKindGeneral, campKindPlayer:
+				case campKindGeneral, campKindPlayer, campKindSession:
 					m.campOpenEditor()
 				}
 				return m, nil
@@ -1365,10 +1506,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "up", "k":
 				if m.campCursor > 0 {
 					m.campCursor--
+					m.campTaskFocus = false
 				}
 			case "down", "j":
 				if m.campCursor < len(m.campItems)-1 {
 					m.campCursor++
+					m.campTaskFocus = false
 				}
 			case "right", "l":
 				item := m.campCurrentItem()
@@ -1423,6 +1566,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.campAddKind = campKindSession
 					m.campAdding = true
 					m.campAddInput = fmt.Sprintf("Session %d", len(m.campaign.Campaigns[item.campIdx].Sessions)+1)
+				}
+			case "t":
+				m.campTaskAdding = true
+				m.campTaskInput = ""
+			case "b":
+				item := m.campCurrentItem()
+				if item != nil && (item.kind == campKindPlayer || item.kind == campKindSession) {
+					switch item.kind {
+					case campKindPlayer:
+						m.campBlurbInput = m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb
+					case campKindSession:
+						m.campBlurbInput = m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb
+					}
+					m.campBlurbEditing = true
 				}
 			case "r":
 				item := m.campCurrentItem()
@@ -1988,7 +2145,19 @@ func (m model) View() string {
 		r := node.Resource
 		indent := strings.Repeat("  ", node.Depth)
 		icon := resourceIcon(r.IconGlyph)
+
+		// Compute max width for the name using plain widths only,
+		// so ANSI codes in foldIcon don't skew the measurement.
+		// Reserve 1 for the ▌ accent on the selected line.
+		nameMaxW := sideW - 1 - runewidth.StringWidth(indent) - 2 - runewidth.StringWidth(icon)
+		if nameMaxW < 1 {
+			nameMaxW = 1
+		}
 		name := r.Name
+		if runewidth.StringWidth(name) > nameMaxW {
+			name = runewidth.Truncate(name, nameMaxW-1, "…")
+		}
+
 		var foldIcon string
 		if len(m.children[r.ID]) > 0 {
 			if m.expanded[r.ID] {
@@ -2000,11 +2169,6 @@ func (m model) View() string {
 			foldIcon = "  "
 		}
 		line := indent + foldIcon + icon + name
-
-		maxW := sideW - 2
-		if runewidth.StringWidth(line) > maxW {
-			line = runewidth.Truncate(line, maxW-1, "…")
-		}
 
 		if i == m.cursor {
 			accent := lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Render("▌")
@@ -2230,8 +2394,18 @@ func (m model) viewCampaign() string {
 		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
 		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") +
 			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campAddInput) + cur
+	} else if m.campTaskAdding {
+		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+		hintText = lipgloss.NewStyle().Foreground(colorGold).Render("Ny opgave: ") +
+			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campTaskInput) + cur
+	} else if m.campBlurbEditing {
+		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+		hintText = lipgloss.NewStyle().Foreground(colorGold).Render("Blurb: ") +
+			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campBlurbInput) + cur
+	} else if m.campTaskFocus {
+		hintText = sDim.Render("j/k=naviger  Space/Enter=toggle  d=slet  t=ny opgave  Esc=luk")
 	} else {
-		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  c=kampagne  i=initiative  r=omdøb  d=slet  Ctrl+R=indsæt ref (under redigering)")
+		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  t=opgave  c=kampagne  i=initiative  b=blurb  r=omdøb  d=slet")
 	}
 	searchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(hintText)
 	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(sBorderNormal)).Render(strings.Repeat("─", m.width))
@@ -2518,39 +2692,105 @@ func (m model) viewCampaign() string {
 		lines = append(lines, "")
 		lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(camp.Name))
 		lines = append(lines, "")
+
+		// ── Tasks ──
+		taskTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("✓  Opgaver")
+		if m.campTaskFocus {
+			lines = append(lines, "  "+taskTitle+"  "+sDim.Render("Space/Enter=toggle  d=slet  t=ny  Esc=luk"))
+		} else {
+			lines = append(lines, "  "+taskTitle+"  "+sDim.Render("Enter=rediger  t=ny"))
+		}
+		lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
+		if len(camp.Tasks) == 0 {
+			lines = append(lines, "    "+sDim.Render("Ingen opgaver — tryk 't' for at tilføje"))
+		} else {
+			for i, task := range camp.Tasks {
+				var check string
+				var nameRender string
+				if task.Done {
+					check = lipgloss.NewStyle().Foreground(colorGreen).Render("✓")
+					nameRender = lipgloss.NewStyle().Foreground(colorMuted).Render(task.Name)
+				} else {
+					check = lipgloss.NewStyle().Foreground(colorMuted).Render("○")
+					nameRender = lipgloss.NewStyle().Foreground(colorBright).Render(task.Name)
+				}
+				if m.campTaskFocus && i == m.campTaskCursor {
+					accent := lipgloss.NewStyle().Foreground(colorSelFg).Render("▌ ")
+					lines = append(lines, "  "+accent+check+"  "+nameRender)
+				} else {
+					lines = append(lines, "    "+check+"  "+nameRender)
+				}
+			}
+		}
+		lines = append(lines, "")
+
+		// ── Players ──
+		boxW := contentW - 4
 		if len(camp.Players) == 0 {
 			lines = append(lines, "  "+sDim.Render("Ingen spillere — tryk 'a' for at tilføje"))
 		} else {
-			lines = append(lines, "  "+sDim.Render("Spillere:"))
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render("Spillere"))
+			lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
 			for _, p := range camp.Players {
-				lines = append(lines, "    "+lipgloss.NewStyle().Foreground(colorBright).Render("👤  "+p.Name))
+				box := drawCampBox("👤  "+p.Name, p.Blurb, boxW, colorMuted, colorBright, colorBlue)
+				for _, bl := range strings.Split(box, "\n") {
+					lines = append(lines, "  "+bl)
+				}
 			}
 		}
+		lines = append(lines, "")
+
+		// ── Sessions ──
 		if len(camp.Sessions) > 0 {
-			lines = append(lines, "")
-			lines = append(lines, "  "+sDim.Render("Sessioner:"))
+			lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorBlue).Bold(true).Render("Sessioner"))
+			lines = append(lines, "  "+sDim.Render(strings.Repeat("─", contentW-4)))
 			for _, s := range camp.Sessions {
-				lines = append(lines, "    "+lipgloss.NewStyle().Foreground(colorBright).Render("📅  "+s.Name))
+				box := drawCampBox("📅  "+s.Name, s.Blurb, boxW, colorMuted, colorBright, colorBlue)
+				for _, bl := range strings.Split(box, "\n") {
+					lines = append(lines, "  "+bl)
+				}
 			}
 		}
 		contentBody = strings.Join(lines, "\n")
 	} else {
+		// Show blurb at top for player/session items
+		var blurb string
+		curItem := m.campCurrentItem()
+		if curItem != nil {
+			switch curItem.kind {
+			case campKindPlayer:
+				blurb = m.campaign.Campaigns[curItem.campIdx].Players[curItem.playerIdx].Blurb
+			case campKindSession:
+				blurb = m.campaign.Campaigns[curItem.campIdx].Sessions[curItem.playerIdx].Blurb
+			}
+		}
+		var parts []string
+		parts = append(parts, "")
+		if curItem != nil && (curItem.kind == campKindPlayer || curItem.kind == campKindSession) {
+			boxW := contentW - 4
+			if blurb != "" {
+				parts = append(parts, "  "+drawCampBox("", blurb, boxW, colorMuted, colorMuted, colorBlue))
+			} else {
+				parts = append(parts, "  "+drawCampBox("", "(ingen blurb — tryk 'b' for at tilføje)", boxW, colorFaint, colorFaint, colorMuted))
+			}
+			parts = append(parts, "")
+		}
 		note := m.campCurrentNote()
 		if note == "" {
-			contentBody = "\n  " + sDim.Render("Ingen noter endnu — tryk Enter for at begynde.")
+			parts = append(parts, "  "+sDim.Render("Ingen noter endnu — tryk Enter for at begynde."))
 		} else {
 			hasRefs := len(m.campNoteRefs(note)) > 0
 			var lines []string
 			for _, l := range strings.Split(note, "\n") {
-				rendered := "  " + applyInlineStyles(highlightMentions(l))
-				lines = append(lines, rendered)
+				lines = append(lines, "  "+applyInlineStyles(highlightMentions(l)))
 			}
-			body := "\n" + strings.Join(lines, "\n")
+			parts = append(parts, strings.Join(lines, "\n"))
 			if hasRefs {
-				body += "\n\n  " + sDim.Render("f") + sDim.Render(" = følg reference")
+				parts = append(parts, "")
+				parts = append(parts, "  "+sDim.Render("f")+"  "+sDim.Render("= følg reference"))
 			}
-			contentBody = body
 		}
+		contentBody = strings.Join(parts, "\n")
 	}
 
 	// Combine
@@ -2591,8 +2831,12 @@ func (m model) viewCampaign() string {
 		keys = [][]string{{"Enter", "gem"}, {"Esc", "annuller"}}
 	} else if m.campEditing {
 		keys = [][]string{{"Enter", "gem & luk"}, {"Esc", "gem & luk"}}
+	} else if m.campTaskFocus {
+		keys = [][]string{{"j/k", "naviger"}, {"Space", "toggle"}, {"d", "slet"}, {"t", "ny opgave"}, {"Esc", "luk"}}
+	} else if m.campBlurbEditing || m.campTaskAdding {
+		keys = [][]string{{"Enter", "gem"}, {"Esc", "annuller"}}
 	} else {
-		keys = [][]string{{"↑↓ jk", "naviger"}, {"→ ←", "fold"}, {"Enter", "åbn/rediger"}, {"a", "spiller"}, {"s", "session"}, {"c", "kampagne"}, {"i", "initiative"}, {"r", "omdøb"}, {"d", "slet"}, {"Tab", "verden"}}
+		keys = [][]string{{"↑↓ jk", "naviger"}, {"→ ←", "fold"}, {"Enter", "åbn/rediger"}, {"a", "spiller"}, {"s", "session"}, {"t", "opgave"}, {"b", "blurb"}, {"c", "kampagne"}, {"i", "initiative"}, {"r", "omdøb"}, {"d", "slet"}, {"Tab", "verden"}}
 	}
 	var keyParts []string
 	for _, k := range keys {
@@ -2605,6 +2849,68 @@ func (m model) viewCampaign() string {
 
 // visLen returns the visible display width of a string, stripping ANSI escapes
 // and using go-runewidth for accurate wide-character (emoji, CJK) measurement.
+// drawCampBox draws a box with precise width control.
+// title="" → plain top border. body="" → no body lines (compact box).
+func drawCampBox(title, body string, boxW int, borderFg, titleFg, bodyFg lipgloss.Color) string {
+	bStyle := lipgloss.NewStyle().Foreground(borderFg)
+	tStyle := lipgloss.NewStyle().Foreground(titleFg).Bold(true)
+	bBody := lipgloss.NewStyle().Foreground(bodyFg)
+
+	innerW := boxW - 4 // │·content·│ → 2 border + 2 padding
+	if innerW < 1 {
+		innerW = 1
+	}
+
+	// Top border
+	var top string
+	if title == "" {
+		top = bStyle.Render("╭" + strings.Repeat("─", boxW-2) + "╮")
+	} else {
+		titleVisW := runewidth.StringWidth(title)
+		dashes := boxW - 5 - titleVisW // "╭─ " + title + " " + dashes + "╮"
+		if dashes < 0 {
+			dashes = 0
+		}
+		top = bStyle.Render("╭─ ") + tStyle.Render(title) + bStyle.Render(" "+strings.Repeat("─", dashes)+"╮")
+	}
+
+	var lines []string
+	lines = append(lines, top)
+
+	// Body lines with word-wrap
+	if body != "" {
+		var wrapped []string
+		for _, line := range strings.Split(body, "\n") {
+			if runewidth.StringWidth(line) <= innerW {
+				wrapped = append(wrapped, line)
+			} else {
+				words := strings.Fields(line)
+				cur := ""
+				for _, w := range words {
+					if cur == "" {
+						cur = w
+					} else if runewidth.StringWidth(cur)+1+runewidth.StringWidth(w) <= innerW {
+						cur += " " + w
+					} else {
+						wrapped = append(wrapped, cur)
+						cur = w
+					}
+				}
+				if cur != "" {
+					wrapped = append(wrapped, cur)
+				}
+			}
+		}
+		for _, wl := range wrapped {
+			pad := strings.Repeat(" ", max(0, innerW-runewidth.StringWidth(wl)))
+			lines = append(lines, bStyle.Render("│ ")+bBody.Render(wl+pad)+bStyle.Render(" │"))
+		}
+	}
+
+	lines = append(lines, bStyle.Render("╰"+strings.Repeat("─", boxW-2)+"╯"))
+	return strings.Join(lines, "\n")
+}
+
 func visLen(s string) int {
 	// Strip ANSI escape sequences first
 	var clean strings.Builder
