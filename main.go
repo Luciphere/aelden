@@ -1057,11 +1057,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				case "up", "k":
-					if m.campRefSearch == "" && m.campRefCursor > 0 {
+					if m.campRefInsert {
+						m.campRefSearch += string(msg.Runes)
+						m.campRefCursor = 0
+					} else if m.campRefCursor > 0 {
 						m.campRefCursor--
 					}
 				case "down", "j":
-					if m.campRefSearch == "" && m.campRefCursor < len(filtered)-1 {
+					if m.campRefInsert {
+						m.campRefSearch += string(msg.Runes)
+						m.campRefCursor = 0
+					} else if m.campRefCursor < len(filtered)-1 {
 						m.campRefCursor++
 					}
 				case "backspace":
@@ -1075,7 +1081,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				default:
 					if len(msg.Runes) == 1 {
 						if m.campRefInsert {
-							// text search for insert mode
 							m.campRefSearch += string(msg.Runes)
 							m.campRefCursor = 0
 						} else if msg.Runes[0] >= '0' && msg.Runes[0] <= '9' {
@@ -2700,7 +2705,7 @@ func (m *model) campRefFiltered() []Resource {
 		tag := strings.TrimPrefix(q, "#")
 		for _, r := range m.resources {
 			var match bool
-			if q == "" {
+			if q == "" || (isTag && tag == "") {
 				match = true
 			} else if isTag {
 				for _, t := range r.Tags {
