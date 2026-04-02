@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
+	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -623,6 +624,7 @@ type viewMode int
 const (
 	worldView viewMode = iota
 	campaignView
+	plotView
 )
 
 type Player struct {
@@ -647,6 +649,18 @@ type Task struct {
 	Done bool   `json:"done"`
 }
 
+type PlotNode struct {
+	ID          string     `json:"id"`
+	Title       string     `json:"title"`
+	Description string     `json:"description,omitempty"`
+	Consequence string     `json:"consequence,omitempty"`
+	WikiRef     string     `json:"wikiRef,omitempty"`
+	WikiName    string     `json:"wikiName,omitempty"`
+	Chosen      bool       `json:"chosen"`
+	Children    []PlotNode `json:"children,omitempty"`
+}
+
+
 type Campaign struct {
 	Name       string      `json:"name"`
 	General    string      `json:"general"`
@@ -654,6 +668,7 @@ type Campaign struct {
 	Sessions   []Session   `json:"sessions"`
 	Tasks      []Task      `json:"tasks,omitempty"`
 	Initiative []Combatant `json:"initiative,omitempty"`
+	Plot       []PlotNode  `json:"plot,omitempty"`
 }
 
 type CampaignData struct {
@@ -725,13 +740,13 @@ type model struct {
 	campItems    []campListItem
 	campCursor   int
 	campEditing  bool
-	campAdding   bool
-	campAddKind  campItemKind
-	campAddInput string
-	campConfirm     bool
-	campRenaming    bool
-	campRenameInput string
-	ta              textarea.Model
+	campAdding  bool
+	campAddKind campItemKind
+	campConfirm  bool
+	campRenaming bool
+	campInput    textinput.Model // shared single-line input for add/rename/task
+	ta           textarea.Model
+	campBlurbTA  textarea.Model // textarea for blurb editing
 
 	// campaign reference picker
 	campRefPicking   bool
@@ -744,11 +759,16 @@ type model struct {
 	campTaskFocus  bool
 	campTaskCursor int
 	campTaskAdding bool
-	campTaskInput  string
 
 	// blurb editing
 	campBlurbEditing bool
-	campBlurbInput   string
+
+	// sidebar scrolling
+	campListOffset int
+
+	// campaign search
+	campSearchQuery  string
+	campSearchActive bool
 
 	// initiative tracker
 	showInitiative bool
@@ -759,6 +779,28 @@ type model struct {
 	initAddPhase   int // 0=name, 1=initiative number
 	initAddName    string
 	initAddInput   string
+
+	// plot / decision tree (standalone view)
+	plotSideCursor  int  // which campaign is selected in plot view sidebar
+	plotCampIdx     int  // derived from plotSideCursor on entry
+	plotSideFocus   bool // true = keyboard focus is on the campaign sidebar
+	plotFocusCol    int  // which column has keyboard focus
+	plotColCursor  []int  // cursor position per column
+	plotColOffset  []int  // scroll offset per column
+	plotViewStart  int    // leftmost visible column
+	plotEditing    bool
+	plotEditField  string // "desc" or "consequence"
+	plotConfirm    bool
+	plotAdding     bool
+	plotRenaming   bool
+	plotRefPicking bool
+
+	// plot search
+	plotSearchQuery  string
+	plotSearchActive bool
+
+	// help screen
+	showHelp bool
 
 	// file watching
 	fileMod      time.Time
@@ -785,6 +827,17 @@ func initialModel(exp Export) model {
 	ta.ShowLineNumbers = false
 	ta.CharLimit = 0
 
+	ci := textinput.New()
+	ci.TextStyle = lipgloss.NewStyle().Foreground(colorSelFg)
+	ci.CursorStyle = lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg)
+	ci.CharLimit = 120
+
+	blurbTA := textarea.New()
+	blurbTA.Placeholder = "Skriv blurb her..."
+	blurbTA.ShowLineNumbers = false
+	blurbTA.CharLimit = 0
+
+
 	var fileMod time.Time
 	if info, err := os.Stat(dataPath); err == nil {
 		fileMod = info.ModTime()
@@ -806,7 +859,9 @@ func initialModel(exp Export) model {
 		campaign:     loadCampaign(),
 		campaignPath: campaignFilePath(),
 		campExpanded: campExpanded,
-		ta:           ta,
+		ta:          ta,
+		campInput:   ci,
+		campBlurbTA: blurbTA,
 		focus:        focusList,
 		fileMod:      fileMod,
 	}
@@ -903,10 +958,31 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.ta.SetWidth(m.width - m.sidebarWidth() - 6)
 		m.ta.SetHeight(m.height - 8)
+		blurbW := m.width - m.sidebarWidth() - 10
+		if blurbW < 10 {
+			blurbW = 10
+		}
+		m.campBlurbTA.SetWidth(blurbW)
+		m.campBlurbTA.SetHeight(4)
+		m.campInput.Width = m.width - m.sidebarWidth() - 20
+		if m.campInput.Width < 10 {
+			m.campInput.Width = 10
+		}
 		return m, nil
 
 	case tea.KeyMsg:
-		if m.mode == campaignView {
+		if msg.String() == "ctrl+c" || msg.String() == "q" {
+			return m, tea.Quit
+		}
+		if msg.String() == "?" {
+			m.showHelp = !m.showHelp
+			return m, nil
+		}
+		if m.showHelp {
+			m.showHelp = false
+			return m, nil
+		}
+		if m.mode == campaignView || m.mode == plotView {
 			// ── initiative tracker ────────────────────────────────
 			if m.showInitiative {
 				init := m.campaign.Campaigns[m.initCampIdx].Initiative
@@ -1031,6 +1107,271 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 
+			// ── plot view is a separate mode (if m.mode == plotView below) ──
+		if m.mode == plotView {
+			// editing description or consequence (single-line, Enter saves)
+			if m.plotEditing {
+					switch msg.String() {
+					case "ctrl+c":
+						return m, tea.Quit
+					case "esc":
+						m.plotEditing = false
+						m.campInput.Blur()
+					case "enter":
+						cur := m.plotCurrentNode()
+						if cur != nil {
+							val := m.campInput.Value()
+							if m.plotEditField == "desc" {
+								cur.Description = val
+							} else {
+								cur.Consequence = val
+							}
+							m.campaign.Campaigns[m.plotCampIdx].Plot =
+								m.plotSetNode(m.campaign.Campaigns[m.plotCampIdx].Plot,
+									m.plotCurrentPath(), *cur)
+							m.saveCampaign()
+						}
+						m.plotEditing = false
+						m.campInput.Blur()
+					default:
+						var cmd tea.Cmd
+						m.campInput, cmd = m.campInput.Update(msg)
+						cmds = append(cmds, cmd)
+					}
+					return m, tea.Batch(cmds...)
+				}
+				// adding new node (Enter saves)
+				if m.plotAdding {
+					switch msg.String() {
+					case "ctrl+c":
+						return m, tea.Quit
+					case "esc":
+						m.plotAdding = false
+						m.campInput.Blur()
+					case "enter":
+						title := strings.TrimSpace(m.campInput.Value())
+						if title != "" {
+							node := PlotNode{
+								ID:    fmt.Sprintf("n%d", time.Now().UnixNano()),
+								Title: title,
+							}
+							parentPath := m.plotParentPath()
+							plot := m.campaign.Campaigns[m.plotCampIdx].Plot
+							plot = m.plotAddChildAt(plot, parentPath, node)
+							m.campaign.Campaigns[m.plotCampIdx].Plot = plot
+							m.saveCampaign()
+							// move cursor to new node
+							nodes := m.plotNodesAtCol(m.plotFocusCol)
+							idx := len(nodes) - 1
+							if idx < 0 {
+								idx = 0
+							}
+							m.setPlotColCursor(m.plotFocusCol, idx)
+						}
+						m.plotAdding = false
+						m.campInput.Blur()
+					default:
+						var cmd tea.Cmd
+						m.campInput, cmd = m.campInput.Update(msg)
+						cmds = append(cmds, cmd)
+					}
+					return m, tea.Batch(cmds...)
+				}
+				// renaming a plot node (Enter saves)
+				if m.plotRenaming {
+					switch msg.String() {
+					case "ctrl+c":
+						return m, tea.Quit
+					case "esc":
+						m.plotRenaming = false
+						m.campInput.Blur()
+					case "enter":
+						title := strings.TrimSpace(m.campInput.Value())
+						if title != "" {
+							cur := m.plotCurrentNode()
+							if cur != nil {
+								cur.Title = title
+								m.campaign.Campaigns[m.plotCampIdx].Plot =
+									m.plotSetNode(m.campaign.Campaigns[m.plotCampIdx].Plot,
+										m.plotCurrentPath(), *cur)
+								m.saveCampaign()
+							}
+						}
+						m.plotRenaming = false
+						m.campInput.Blur()
+					default:
+						var cmd tea.Cmd
+						m.campInput, cmd = m.campInput.Update(msg)
+						cmds = append(cmds, cmd)
+					}
+					return m, tea.Batch(cmds...)
+				}
+				// confirm delete
+				if m.plotConfirm {
+					switch msg.String() {
+					case "j", "y":
+						path := m.plotCurrentPath()
+						m.campaign.Campaigns[m.plotCampIdx].Plot =
+							plotDeleteAt(m.campaign.Campaigns[m.plotCampIdx].Plot, path)
+						m.saveCampaign()
+						// reset cursor in this column
+						nodes := m.plotNodesAtCol(m.plotFocusCol)
+						cur := m.plotColCursorAt(m.plotFocusCol)
+						if cur >= len(nodes) {
+							m.setPlotColCursor(m.plotFocusCol, max(0, len(nodes)-1))
+						}
+						// clear child columns
+						m.resetPlotColsAfter(m.plotFocusCol)
+						m.plotConfirm = false
+					case "n", "esc":
+						m.plotConfirm = false
+					}
+					return m, nil
+				}
+				// sidebar focus: navigate campaign list
+				if m.plotSideFocus {
+					switch msg.String() {
+					case "tab":
+						m.plotSideFocus = false
+						m.campInput.Blur()
+						m.mode = worldView
+						return m, nil
+					case "j", "down":
+						if m.plotSideCursor < len(m.campaign.Campaigns)-1 {
+							m.plotSideCursor++
+						}
+					case "k", "up":
+						if m.plotSideCursor > 0 {
+							m.plotSideCursor--
+						}
+					case "right", "l", "enter":
+						m.plotCampIdx = m.plotSideCursor
+						m.plotFocusCol = 0
+						m.plotViewStart = 0
+						m.plotColCursor = []int{0}
+						m.plotColOffset = []int{0}
+						m.plotSideFocus = false
+					}
+					return m, nil
+				}
+				// plot search
+				if m.plotSearchActive {
+					switch msg.String() {
+					case "esc":
+						m.plotSearchActive = false
+						m.plotSearchQuery = ""
+					case "enter":
+						m.plotSearchActive = false
+					case "backspace":
+						if len(m.plotSearchQuery) > 0 {
+							runes := []rune(m.plotSearchQuery)
+							m.plotSearchQuery = string(runes[:len(runes)-1])
+						}
+					default:
+						if len(msg.Runes) == 1 {
+							m.plotSearchQuery += string(msg.Runes)
+						}
+					}
+					return m, nil
+				}
+				// normal plot navigation
+				switch msg.String() {
+				case "ctrl+c":
+					return m, tea.Quit
+				case "/":
+					m.plotSearchActive = true
+					m.plotSearchQuery = ""
+					return m, nil
+				case "tab":
+					m.campInput.Blur()
+					m.mode = worldView
+					return m, nil
+				case "j", "down":
+					nodes := m.plotNodesAtCol(m.plotFocusCol)
+					cur := m.plotColCursorAt(m.plotFocusCol)
+					if cur < len(nodes)-1 {
+						m.setPlotColCursor(m.plotFocusCol, cur+1)
+						m.resetPlotColsAfter(m.plotFocusCol)
+					}
+				case "k", "up":
+					cur := m.plotColCursorAt(m.plotFocusCol)
+					if cur > 0 {
+						m.setPlotColCursor(m.plotFocusCol, cur-1)
+						m.resetPlotColsAfter(m.plotFocusCol)
+					}
+				case "right", "l", "enter":
+					// move focus to next column (children of current node)
+					m.plotFocusCol++
+					m.ensurePlotCol(m.plotFocusCol)
+					if m.plotFocusCol-m.plotViewStart >= 3 {
+						m.plotViewStart = m.plotFocusCol - 2
+					}
+				case "left", "h":
+					if m.plotFocusCol > 0 {
+						m.plotFocusCol--
+						if m.plotFocusCol < m.plotViewStart {
+							m.plotViewStart = m.plotFocusCol
+						}
+					} else {
+						m.plotSideFocus = true
+					}
+				case " ":
+					cur := m.plotCurrentNode()
+					if cur != nil {
+						cur.Chosen = !cur.Chosen
+						m.campaign.Campaigns[m.plotCampIdx].Plot =
+							m.plotSetNode(m.campaign.Campaigns[m.plotCampIdx].Plot,
+								m.plotCurrentPath(), *cur)
+						m.saveCampaign()
+					}
+				case "n":
+					// add node in the current column
+					m.plotAdding = true
+					m.campInput.SetValue("")
+					m.campInput.Focus()
+				case "r":
+					cur := m.plotCurrentNode()
+					if cur != nil {
+						m.campInput.SetValue(cur.Title)
+						m.campInput.CursorEnd()
+						m.campInput.Focus()
+						m.plotRenaming = true
+					}
+				case "e":
+					cur := m.plotCurrentNode()
+					if cur != nil {
+						m.campInput.SetValue(cur.Description)
+						m.campInput.CursorEnd()
+						m.campInput.Focus()
+						m.plotEditField = "desc"
+						m.plotEditing = true
+					}
+				case "c":
+					cur := m.plotCurrentNode()
+					if cur != nil {
+						m.campInput.SetValue(cur.Consequence)
+						m.campInput.CursorEnd()
+						m.campInput.Focus()
+						m.plotEditField = "consequence"
+						m.plotEditing = true
+					}
+				case "d":
+					if m.plotCurrentNode() != nil {
+						m.plotConfirm = true
+					}
+				case "ctrl+r":
+					cur := m.plotCurrentNode()
+					if cur != nil {
+						m.plotRefPicking = true
+						m.campRefPicking = true
+						m.campRefInsert = true
+						m.campRefSearch = ""
+						m.campRefCursor = 0
+					}
+				}
+				return m, nil
+			}
+
 			// ── reference picker ─────────────────────────────────
 			if m.campRefPicking {
 				filtered := m.campRefFiltered()
@@ -1050,6 +1391,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.campRefCursor = 0
 					} else {
 						m.campRefPicking = false
+						m.plotRefPicking = false
 					}
 				case "enter":
 					if m.campRefInsert {
@@ -1063,7 +1405,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						} else {
 							// insert the selected article
 							if m.campRefCursor < len(filtered) {
-								m.ta.SetValue(m.ta.Value() + "[" + filtered[m.campRefCursor].Name + "]")
+								res := filtered[m.campRefCursor]
+								if m.plotRefPicking {
+									// save as wiki link on current plot node
+									cur := m.plotCurrentNode()
+									if cur != nil {
+										cur.WikiRef = res.ID
+										cur.WikiName = res.Name
+										m.campaign.Campaigns[m.plotCampIdx].Plot =
+											m.plotSetNode(m.campaign.Campaigns[m.plotCampIdx].Plot,
+												m.plotCurrentPath(), *cur)
+										m.saveCampaign()
+									}
+									m.plotRefPicking = false
+								} else {
+									m.ta.SetValue(m.ta.Value() + "[" + res.Name + "]")
+								}
 							}
 							m.campRefPicking = false
 							m.campRefSearch = ""
@@ -1214,9 +1571,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				case "esc":
 					m.campRenaming = false
-					m.campRenameInput = ""
+					m.campInput.Blur()
 				case "enter":
-					name := strings.TrimSpace(m.campRenameInput)
+					name := strings.TrimSpace(m.campInput.Value())
 					if name != "" {
 						item := m.campCurrentItem()
 						if item != nil {
@@ -1233,18 +1590,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.campRenaming = false
-					m.campRenameInput = ""
-				case "backspace":
-					if len(m.campRenameInput) > 0 {
-						runes := []rune(m.campRenameInput)
-						m.campRenameInput = string(runes[:len(runes)-1])
-					}
+					m.campInput.Blur()
 				default:
-					if len(msg.Runes) == 1 {
-						m.campRenameInput += string(msg.Runes)
-					}
+					var cmd tea.Cmd
+					m.campInput, cmd = m.campInput.Update(msg)
+					cmds = append(cmds, cmd)
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 			// ── adding state ──────────────────────────────────────
@@ -1254,9 +1606,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				case "esc":
 					m.campAdding = false
-					m.campAddInput = ""
+					m.campInput.Blur()
 				case "enter":
-					name := strings.TrimSpace(m.campAddInput)
+					name := strings.TrimSpace(m.campInput.Value())
 					if name != "" {
 						if m.campAddKind == campKindCampaign {
 							m.campaign.Campaigns = append(m.campaign.Campaigns, Campaign{Name: name})
@@ -1268,6 +1620,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							for i, it := range m.campItems {
 								if it.kind == campKindCampaign && it.campIdx == newIdx {
 									m.campCursor = i
+									m.clampCampOffset()
 									break
 								}
 							}
@@ -1286,6 +1639,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							for i, it := range m.campItems {
 								if it.kind == campKindPlayer && it.campIdx == ci && it.playerIdx == newPIdx {
 									m.campCursor = i
+									m.clampCampOffset()
 									break
 								}
 							}
@@ -1304,24 +1658,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							for i, it := range m.campItems {
 								if it.kind == campKindSession && it.campIdx == ci && it.playerIdx == newSIdx {
 									m.campCursor = i
+									m.clampCampOffset()
 									break
 								}
 							}
 						}
 					}
 					m.campAdding = false
-					m.campAddInput = ""
-				case "backspace":
-					if len(m.campAddInput) > 0 {
-						runes := []rune(m.campAddInput)
-						m.campAddInput = string(runes[:len(runes)-1])
-					}
+					m.campInput.Blur()
 				default:
-					if len(msg.Runes) == 1 {
-						m.campAddInput += string(msg.Runes)
-					}
+					var cmd tea.Cmd
+					m.campInput, cmd = m.campInput.Update(msg)
+					cmds = append(cmds, cmd)
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 			// ── task adding ───────────────────────────────────────
@@ -1331,9 +1681,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				case "esc":
 					m.campTaskAdding = false
-					m.campTaskInput = ""
+					m.campInput.Blur()
 				case "enter":
-					name := strings.TrimSpace(m.campTaskInput)
+					name := strings.TrimSpace(m.campInput.Value())
 					if name != "" {
 						item := m.campCurrentItem()
 						ci := 0
@@ -1348,18 +1698,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.campTaskFocus = true
 					}
 					m.campTaskAdding = false
-					m.campTaskInput = ""
-				case "backspace":
-					if len(m.campTaskInput) > 0 {
-						runes := []rune(m.campTaskInput)
-						m.campTaskInput = string(runes[:len(runes)-1])
-					}
+					m.campInput.Blur()
 				default:
-					if len(msg.Runes) == 1 {
-						m.campTaskInput += string(msg.Runes)
-					}
+					var cmd tea.Cmd
+					m.campInput, cmd = m.campInput.Update(msg)
+					cmds = append(cmds, cmd)
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 			// ── blurb editing ─────────────────────────────────────
@@ -1369,31 +1714,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, tea.Quit
 				case "esc":
 					m.campBlurbEditing = false
-					m.campBlurbInput = ""
-				case "enter":
+					m.campBlurbTA.Blur()
+				case "ctrl+s":
 					item := m.campCurrentItem()
 					if item != nil {
+						val := strings.TrimSpace(m.campBlurbTA.Value())
 						switch item.kind {
 						case campKindPlayer:
-							m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb = m.campBlurbInput
+							m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb = val
 						case campKindSession:
-							m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb = m.campBlurbInput
+							m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb = val
 						}
 						m.saveCampaign()
 					}
 					m.campBlurbEditing = false
-					m.campBlurbInput = ""
-				case "backspace":
-					if len(m.campBlurbInput) > 0 {
-						runes := []rune(m.campBlurbInput)
-						m.campBlurbInput = string(runes[:len(runes)-1])
-					}
+					m.campBlurbTA.Blur()
 				default:
-					if len(msg.Runes) == 1 {
-						m.campBlurbInput += string(msg.Runes)
-					}
+					var cmd tea.Cmd
+					m.campBlurbTA, cmd = m.campBlurbTA.Update(msg)
+					cmds = append(cmds, cmd)
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 
 			// ── task focus ────────────────────────────────────────
@@ -1437,7 +1778,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				case "t":
 					m.campTaskFocus = false
 					m.campTaskAdding = true
-					m.campTaskInput = ""
+					m.campInput.SetValue("")
+					m.campInput.Focus()
 				}
 				return m, nil
 			}
@@ -1447,12 +1789,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c", "q":
 				return m, tea.Quit
 			case "tab":
+				if m.mode == plotView {
+					m.campInput.Blur()
+					m.mode = worldView
+					return m, tea.Batch(cmds...)
+				}
 				if m.campEditing {
 					m.campCloseEditor()
 				}
-				m.mode = worldView
+				m.campAdding = false
+				m.campInput.Blur()
+				m.mode = plotView
+				m.plotCampIdx = 0
+				m.plotSideCursor = 0
+				m.plotSideFocus = false
+				m.plotFocusCol = 0
+				m.plotViewStart = 0
+				m.plotColCursor = []int{0}
+				m.plotColOffset = []int{0}
 				return m, tea.Batch(cmds...)
 			case "esc":
+				if m.mode == plotView {
+					m.mode = worldView
+					return m, nil
+				}
 				if m.campEditing {
 					m.campCloseEditor()
 					return m, nil
@@ -1501,29 +1861,66 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Batch(cmds...)
 			}
 
+			// ── campaign search ───────────────────────────────────
+			if m.campSearchActive {
+				switch msg.String() {
+				case "esc":
+					m.campSearchActive = false
+					m.campSearchQuery = ""
+					m.campCursor = 0
+					m.campListOffset = 0
+				case "enter":
+					m.campSearchActive = false
+				case "backspace":
+					if len(m.campSearchQuery) > 0 {
+						runes := []rune(m.campSearchQuery)
+						m.campSearchQuery = string(runes[:len(runes)-1])
+					}
+					m.campCursor = 0
+					m.campListOffset = 0
+				default:
+					if len(msg.Runes) == 1 {
+						m.campSearchQuery += string(msg.Runes)
+						m.campCursor = 0
+						m.campListOffset = 0
+					}
+				}
+				return m, nil
+			}
+
 			// ── normal navigation ─────────────────────────────────
 			switch msg.String() {
+			case "/":
+				m.campSearchActive = true
+				m.campSearchQuery = ""
+				m.campCursor = 0
+				m.campListOffset = 0
+				return m, nil
 			case "up", "k":
 				if m.campCursor > 0 {
 					m.campCursor--
 					m.campTaskFocus = false
+					m.clampCampOffset()
 				}
 			case "down", "j":
-				if m.campCursor < len(m.campItems)-1 {
+				if m.campCursor < len(m.campFilteredItems())-1 {
 					m.campCursor++
 					m.campTaskFocus = false
+					m.clampCampOffset()
 				}
 			case "right", "l":
 				item := m.campCurrentItem()
 				if item != nil && item.kind == campKindCampaign {
 					m.campExpanded[item.campIdx] = true
 					m.buildCampItems()
+					m.clampCampOffset()
 				}
 			case "left", "h":
 				item := m.campCurrentItem()
 				if item != nil && item.kind == campKindCampaign {
 					m.campExpanded[item.campIdx] = false
 					m.buildCampItems()
+					m.clampCampOffset()
 				}
 			case "a":
 				// Add player to the campaign of the current item
@@ -1531,7 +1928,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if item != nil {
 					m.campAddKind = campKindPlayer
 					m.campAdding = true
-					m.campAddInput = ""
+					m.campInput.SetValue("")
+					m.campInput.Focus()
 				}
 			case "f":
 				if m.campRefPicking && !m.campRefInsert {
@@ -1559,39 +1957,51 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "c":
 				m.campAddKind = campKindCampaign
 				m.campAdding = true
-				m.campAddInput = ""
+				m.campInput.SetValue("")
+				m.campInput.Focus()
 			case "s":
 				item := m.campCurrentItem()
 				if item != nil {
 					m.campAddKind = campKindSession
 					m.campAdding = true
-					m.campAddInput = fmt.Sprintf("Session %d", len(m.campaign.Campaigns[item.campIdx].Sessions)+1)
+					defaultName := fmt.Sprintf("Session %d", len(m.campaign.Campaigns[item.campIdx].Sessions)+1)
+					m.campInput.SetValue(defaultName)
+					m.campInput.CursorEnd()
+					m.campInput.Focus()
 				}
 			case "t":
 				m.campTaskAdding = true
-				m.campTaskInput = ""
+				m.campInput.SetValue("")
+				m.campInput.Focus()
 			case "b":
 				item := m.campCurrentItem()
 				if item != nil && (item.kind == campKindPlayer || item.kind == campKindSession) {
+					var existing string
 					switch item.kind {
 					case campKindPlayer:
-						m.campBlurbInput = m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb
+						existing = m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Blurb
 					case campKindSession:
-						m.campBlurbInput = m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb
+						existing = m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Blurb
 					}
+					m.campBlurbTA.SetValue(existing)
+					m.campBlurbTA.Focus()
 					m.campBlurbEditing = true
 				}
 			case "r":
 				item := m.campCurrentItem()
 				if item != nil && item.kind != campKindGeneral {
+					var existing string
 					switch item.kind {
 					case campKindCampaign:
-						m.campRenameInput = m.campaign.Campaigns[item.campIdx].Name
+						existing = m.campaign.Campaigns[item.campIdx].Name
 					case campKindPlayer:
-						m.campRenameInput = m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Name
+						existing = m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Name
 					case campKindSession:
-						m.campRenameInput = m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Name
+						existing = m.campaign.Campaigns[item.campIdx].Sessions[item.playerIdx].Name
 					}
+					m.campInput.SetValue(existing)
+					m.campInput.CursorEnd()
+					m.campInput.Focus()
 					m.campRenaming = true
 				}
 			case "d":
@@ -1653,16 +2063,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case "tab":
-			if m.mode == worldView {
+			switch m.mode {
+			case worldView:
 				m.mode = campaignView
 				m.campEditing = false
 				m.ta.Blur()
-			} else {
+			case campaignView:
 				if m.campEditing {
 					m.campCloseEditor()
 				}
 				m.campAdding = false
-				m.campAddInput = ""
+				m.campInput.Blur()
+				m.mode = plotView
+				m.plotCampIdx = 0
+				m.plotSideCursor = 0
+				m.plotSideFocus = false
+				m.plotFocusCol = 0
+				m.plotViewStart = 0
+				m.plotColCursor = []int{0}
+				m.plotColOffset = []int{0}
+			default:
+				m.campInput.Blur()
 				m.mode = worldView
 			}
 			return m, nil
@@ -1818,8 +2239,8 @@ func (m *model) sidebarWidth() int {
 }
 
 func (m *model) visibleLines() int {
-	// header(1) + searchLine(1) + borderLine(1) + sideHeader w/ bottom border(2) + statusbar(1) = 6 overhead
-	return m.height - 6
+	// header(1) + borderLine(1) + searchLine(1) + sideHeader w/ bottom border(2) = 5 overhead
+	return m.height - 5
 }
 
 func (m *model) clampOffset() {
@@ -1829,6 +2250,19 @@ func (m *model) clampOffset() {
 	}
 	if m.cursor >= m.listOffset+vis {
 		m.listOffset = m.cursor - vis + 1
+	}
+}
+
+func (m *model) clampCampOffset() {
+	vis := m.visibleLines() - 1 // -1 for sidebar header
+	if vis < 1 {
+		vis = 1
+	}
+	if m.campCursor < m.campListOffset {
+		m.campListOffset = m.campCursor
+	}
+	if m.campCursor >= m.campListOffset+vis {
+		m.campListOffset = m.campCursor - vis + 1
 	}
 }
 
@@ -2030,8 +2464,14 @@ func (m model) View() string {
 	if m.width == 0 {
 		return "Loading..."
 	}
+	if m.showHelp {
+		return m.viewHelp()
+	}
 	if m.mode == campaignView {
 		return m.viewCampaign()
+	}
+	if m.mode == plotView {
+		return m.viewPlot()
 	}
 
 	sideW := m.sidebarWidth()
@@ -2044,7 +2484,7 @@ func (m model) View() string {
 		Foreground(colorSelFg).
 		Bold(true).
 		Padding(0, 2).
-		Render("⚔  AELDEN")
+		Render("⚔  ARTIKLER")
 
 	var modeLabel string
 	var modeBg, modeFg lipgloss.Color
@@ -2102,13 +2542,17 @@ func (m model) View() string {
 	} else {
 		searchContent = sDim.Render("/  søg... (#tag for tag-filter)")
 	}
+	if m.notification != "" {
+		notif := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.notification)
+		searchContent = searchContent + strings.Repeat(" ", max(0, m.width-lipgloss.Width(searchContent)-lipgloss.Width(notif)-2)) + notif
+	}
 	searchLine := lipgloss.NewStyle().
 		Background(colorBg).
 		Width(m.width).
 		Padding(0, 1).
 		Render(searchContent)
 	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(divColor)).Render(strings.Repeat("─", m.width))
-	searchBar := searchLine + "\n" + borderLine
+	searchBar := borderLine + "\n" + searchLine
 
 	// ── Sidebar items ─────────────────────────────────────────
 	listBorderColor := sBorderNormal
@@ -2306,33 +2750,393 @@ func (m model) View() string {
 	}
 	main := strings.Join(mainLines, "\n")
 
-	// ── Status bar ────────────────────────────────────────────
-	keys := [][]string{
-		{"/", "søg"}, {"↑↓ jk", "naviger"}, {"→ ←", "fold ud/ind"}, {"Enter", "åbn"},
-		{"^← ^→", "historik"}, {"Tab", "kampagne"}, {"Esc", "tilbage"}, {"q", "afslut"},
+	return header + "\n" + main + "\n" + searchBar
+}
+
+func (m model) viewHelp() string {
+	leftAccent := lipgloss.NewStyle().Background(colorAccent).Foreground(colorAccent).Render("  ")
+	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorAccent).Bold(true).Padding(0, 2).Render("?  HJÆLP")
+	badge := lipgloss.NewStyle().Background(colorAccent).Foreground(colorBg).Bold(true).Render(" HJÆLP ")
+	right := lipgloss.NewStyle().Background(colorBg).Padding(0, 1).Render(badge)
+	gap := m.width - lipgloss.Width(leftAccent) - lipgloss.Width(title) - lipgloss.Width(right)
+	if gap < 0 {
+		gap = 0
 	}
-	if m.selected != nil && len(m.mentions) > 0 {
-		keys = append(keys, []string{"f", "henvisninger"})
+	header := lipgloss.NewStyle().Background(colorBg).Width(m.width).
+		Render(leftAccent + title + strings.Repeat(" ", gap) + right)
+
+	type section struct {
+		name string
+		keys [][]string
 	}
-	var keyParts []string
-	for _, k := range keys {
-		keyParts = append(keyParts, sKey.Render(k[0])+" "+sDim.Render(k[1]))
+	sections := []section{
+		{"Artikler", [][]string{
+			{"/", "søg (skriv for at filtrere)"},
+			{"↑↓  jk", "naviger liste"},
+			{"→  ←", "fold ud / fold ind"},
+			{"Enter", "åbn artikel"},
+			{"Ctrl+← →", "historik frem/tilbage"},
+			{"f", "vis henvisninger"},
+			{"Tab", "gå til Kampagnestyring"},
+		}},
+		{"Kampagnestyring", [][]string{
+			{"/", "søg kampagner/spillere/sessioner"},
+			{"↑↓  jk", "naviger"},
+			{"→  Enter", "åbn / fold ud"},
+			{"←", "fold ind"},
+			{"a", "ny spiller"},
+			{"s", "ny session"},
+			{"c", "ny kampagne"},
+			{"t", "ny opgave"},
+			{"i", "initiativ tracker"},
+			{"b", "rediger blurb"},
+			{"r", "omdøb"},
+			{"d", "slet"},
+			{"Tab", "gå til Plottråde"},
+		}},
+		{"Plottråde", [][]string{
+			{"/", "søg noder (fremhæver match)"},
+			{"↑↓  jk", "naviger kolonne"},
+			{"→  Enter", "gå ind i børn"},
+			{"←", "gå tilbage (til kampagnevalg)"},
+			{"Space", "marker som valgt/fravalgt"},
+			{"n", "ny node"},
+			{"r", "omdøb node"},
+			{"e", "rediger beskrivelse"},
+			{"c", "rediger konsekvens"},
+			{"Ctrl+R", "tilknyt wiki-artikel"},
+			{"d", "slet node"},
+			{"Tab", "gå til Artikler"},
+		}},
+		{"Generelt", [][]string{
+			{"Tab", "skift mellem de tre views"},
+			{"?", "åbn/luk denne hjælpeskærm"},
+			{"q  Ctrl+C", "afslut programmet"},
+		}},
 	}
-	statusContent := strings.Join(keyParts, "  ")
-	if m.notification != "" {
-		notif := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.notification)
-		gap := m.width - lipgloss.Width(statusContent) - lipgloss.Width(notif) - 4
-		if gap > 0 {
-			statusContent = statusContent + strings.Repeat(" ", gap) + notif
+
+	colW := m.width / 2
+	if colW < 30 {
+		colW = 30
+	}
+
+	var lines []string
+	lines = append(lines, "")
+
+	for _, sec := range sections {
+		secTitle := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render("  " + sec.name)
+		lines = append(lines, secTitle)
+		lines = append(lines, "  "+lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", colW-4)))
+		for _, kv := range sec.keys {
+			k := lipgloss.NewStyle().Background(colorFaint).Foreground(colorBright).Padding(0, 1).Render(kv[0])
+			v := sDim.Render("  " + kv[1])
+			lines = append(lines, "  "+k+v)
+		}
+		lines = append(lines, "")
+	}
+
+	body := strings.Join(lines, "\n")
+	borderLine := lipgloss.NewStyle().Foreground(colorAccent).Render(strings.Repeat("─", m.width))
+	hint := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(sDim.Render("tryk en vilkårlig tast for at lukke"))
+	return header + "\n" + body + "\n" + borderLine + "\n" + hint
+}
+
+func (m model) viewPlot() string {
+	if m.width == 0 {
+		return "Loading..."
+	}
+	sideW := m.sidebarWidth()
+	vis := m.visibleLines()
+	contentW := m.width - sideW - 1
+
+	// ── Header ────────────────────────────────────────────────
+	leftAccent := lipgloss.NewStyle().Background(colorGold).Foreground(colorGold).Render("  ")
+	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorGold).Bold(true).Padding(0, 2).Render("🌿  PLOTTRÅDE")
+	modeBadge := lipgloss.NewStyle().Background(colorGold).Foreground(colorBg).Bold(true).Render(" PLOTTRÅDE ")
+	right := lipgloss.NewStyle().Background(colorBg).Padding(0, 1).Render(modeBadge)
+	headerGap := m.width - lipgloss.Width(leftAccent) - lipgloss.Width(title) - lipgloss.Width(right)
+	if headerGap < 0 {
+		headerGap = 0
+	}
+	header := leftAccent + title + strings.Repeat(" ", headerGap) + right
+	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header)
+
+	// ── Sidebar: campaign list ────────────────────────────────
+	sideLabel := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGold).Bold(true).Padding(0, 1).
+		Render(fmt.Sprintf("PLOTTRÅDE  %d", len(m.campaign.Campaigns)))
+	sideHeader := lipgloss.NewStyle().Background(colorSideBg).
+		Border(lipgloss.NormalBorder(), false, false, true, false).
+		BorderForeground(colorGold).Width(sideW).Render(sideLabel)
+
+	var sideLines []string
+	maxVisible := vis - 1
+	for i, c := range m.campaign.Campaigns {
+		name := c.Name
+		maxW := sideW - 2
+		if runewidth.StringWidth(name) > maxW {
+			name = runewidth.Truncate(name, maxW-1, "…")
+		}
+		if i == m.plotSideCursor && m.plotSideFocus {
+			accent := lipgloss.NewStyle().Background(colorSelBg).Foreground(colorGold).Bold(true).Render("▌")
+			rest := lipgloss.NewStyle().Background(colorSelBg).Foreground(colorGold).Bold(true).
+				Render(name + strings.Repeat(" ", max(0, sideW-1-visLen(name))))
+			sideLines = append(sideLines, accent+rest)
+		} else if i == m.plotCampIdx {
+			accent := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGold).Render("▌")
+			rest := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGold).Bold(true).
+				Render(name + strings.Repeat(" ", max(0, sideW-1-visLen(name))))
+			sideLines = append(sideLines, accent+rest)
+		} else {
+			sideLines = append(sideLines, lipgloss.NewStyle().Background(colorSideBg).Foreground(colorBright).Render(name))
 		}
 	}
-	statusBar := lipgloss.NewStyle().
-		Background(colorBg).
-		Width(m.width).
-		Padding(0, 1).
-		Render(statusContent)
+	for len(sideLines) < maxVisible {
+		sideLines = append(sideLines, lipgloss.NewStyle().Background(colorSideBg).Render(strings.Repeat(" ", sideW)))
+	}
 
-	return header + "\n" + searchBar + "\n" + main + "\n" + statusBar
+	// ── Hint bar ──────────────────────────────────────────────
+	var pHint string
+	if m.plotConfirm {
+		pHint = lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("Slet node (og alle børn)? ") +
+			sKey.Render("j") + sDim.Render(" ja  ") + sKey.Render("n / Esc") + sDim.Render(" annuller")
+	} else if m.plotAdding {
+		pHint = lipgloss.NewStyle().Foreground(colorGold).Render("Ny node: ") + m.campInput.View()
+	} else if m.plotRenaming {
+		pHint = lipgloss.NewStyle().Foreground(colorGold).Render("Omdøb: ") + m.campInput.View()
+	} else if m.plotEditing {
+		fieldLabel := "Beskrivelse"
+		if m.plotEditField == "consequence" {
+			fieldLabel = "Konsekvens"
+		}
+		pHint = lipgloss.NewStyle().Foreground(colorGold).Render(fieldLabel+": ") + m.campInput.View()
+	} else if m.plotSideFocus {
+		pHint = sDim.Render("↑↓/jk=vælg kampagne  → Enter=åbn  Tab=artikler")
+	} else if m.plotSearchActive {
+		queryText := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(m.plotSearchQuery)
+		cursor := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+		label := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("SØGER ")
+		pHint = label + queryText + cursor + sDim.Render("  Esc=ryd  Enter=bekræft")
+	} else {
+		pHint = sDim.Render("/=søg  ↑↓/jk=naviger  → Enter=ind  ←=kampagner  Space=valgt  n=tilføj  e=beskriv  c=konsekvens  r=omdøb  Ctrl+R=wiki  d=slet  Tab=artikler")
+	}
+	pDivColor := colorGold
+	if m.plotSearchActive {
+		pDivColor = sBorderActive
+	}
+	pSearchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(pHint)
+	pBorderLine := lipgloss.NewStyle().Foreground(pDivColor).Render(strings.Repeat("─", m.width))
+	pSearchBar := pBorderLine + "\n" + pSearchLine
+
+	// ── Column view ───────────────────────────────────────────
+	const numCols = 3
+	treeH := (vis * 2) / 3
+	if treeH < 5 {
+		treeH = 5
+	}
+	colW := contentW / numCols
+	if colW < 10 {
+		colW = 10
+	}
+
+	colLines := make([][]string, numCols)
+	for ci := 0; ci < numCols; ci++ {
+		absCol := m.plotViewStart + ci
+		nodes := m.plotNodesAtCol(absCol)
+		isFocused := absCol == m.plotFocusCol
+		cursor := m.plotColCursorAt(absCol)
+		offset := m.plotColOffsetAt(absCol)
+
+		var colHeaderStr string
+		if absCol == 0 {
+			colHeaderStr = "Startpunkter"
+		} else {
+			parentPath := make([]int, absCol)
+			for pi := 0; pi < absCol; pi++ {
+				parentPath[pi] = m.plotColCursorAt(pi)
+			}
+			parent := plotNodeAt(m.campaign.Campaigns[m.plotCampIdx].Plot, parentPath)
+			if parent != nil {
+				colHeaderStr = parent.Title
+			} else {
+				colHeaderStr = "…"
+			}
+		}
+		headerFg := colorMuted
+		if isFocused {
+			headerFg = colorGold
+		}
+		if runewidth.StringWidth(colHeaderStr) > colW-2 {
+			colHeaderStr = runewidth.Truncate(colHeaderStr, colW-3, "…")
+		}
+		colHeader := lipgloss.NewStyle().Foreground(headerFg).Bold(isFocused).Render(colHeaderStr)
+		colLines[ci] = append(colLines[ci], " "+colHeader)
+		colLines[ci] = append(colLines[ci], " "+lipgloss.NewStyle().Foreground(headerFg).Render(strings.Repeat("─", colW-2)))
+
+		if len(nodes) == 0 {
+			colLines[ci] = append(colLines[ci], " "+sDim.Render("(tom)"))
+			if isFocused {
+				colLines[ci] = append(colLines[ci], " "+sDim.Render("n=tilføj"))
+			}
+		} else {
+			end := offset + (treeH - 2)
+			if end > len(nodes) {
+				end = len(nodes)
+			}
+			if offset > 0 {
+				colLines[ci] = append(colLines[ci], " "+lipgloss.NewStyle().Foreground(colorGold).Render("↑"))
+			}
+			for ni := offset; ni < end; ni++ {
+				node := nodes[ni]
+				var chosenMark string
+				if node.Chosen {
+					chosenMark = lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("✓ ")
+				} else {
+					chosenMark = lipgloss.NewStyle().Foreground(colorMuted).Render("○ ")
+				}
+				hasKids := len(node.Children) > 0
+				var arrow string
+				if hasKids {
+					arrow = lipgloss.NewStyle().Foreground(colorMuted).Render(" →")
+				} else {
+					arrow = "  "
+				}
+				maxTitleW := colW - 6
+				nodeTitle := node.Title
+				if runewidth.StringWidth(nodeTitle) > maxTitleW {
+					nodeTitle = runewidth.Truncate(nodeTitle, maxTitleW-1, "…")
+				}
+				isSelected := isFocused && ni == cursor
+				isActive := !isFocused && ni == cursor
+				isMatch := m.plotSearchQuery != "" && strings.Contains(strings.ToLower(node.Title), strings.ToLower(m.plotSearchQuery))
+				var line string
+				if isSelected {
+					accent := lipgloss.NewStyle().Foreground(colorGold).Render("▌")
+					rest := lipgloss.NewStyle().Background(colorSelBg).Foreground(colorSelFg).Bold(true).
+						Render(chosenMark + nodeTitle + strings.Repeat(" ", max(0, colW-2-visLen(chosenMark+nodeTitle+arrow))) + arrow)
+					line = accent + rest
+				} else if isActive {
+					line = " " + lipgloss.NewStyle().Foreground(colorBlue).Render(chosenMark+nodeTitle) + arrow
+				} else if isMatch {
+					line = " " + lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("* ") + lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(nodeTitle) + arrow
+				} else {
+					fg := colorBright
+					if node.Chosen {
+						fg = colorMuted
+					}
+					if m.plotSearchQuery != "" {
+						fg = colorMuted // dim non-matching nodes
+					}
+					line = " " + chosenMark + lipgloss.NewStyle().Foreground(fg).Render(nodeTitle) + arrow
+				}
+				colLines[ci] = append(colLines[ci], line)
+			}
+			if end < len(nodes) {
+				colLines[ci] = append(colLines[ci], " "+lipgloss.NewStyle().Foreground(colorGold).Render("↓"))
+			}
+		}
+		for len(colLines[ci]) < treeH {
+			colLines[ci] = append(colLines[ci], "")
+		}
+	}
+
+	colDiv := lipgloss.NewStyle().Foreground(colorDivider).Render("│")
+	var treeRendered []string
+	for row := 0; row < treeH; row++ {
+		var rowParts []string
+		for ci := 0; ci < numCols; ci++ {
+			cell := ""
+			if row < len(colLines[ci]) {
+				cell = colLines[ci][row]
+			}
+			vl := visLen(cell)
+			if vl < colW {
+				cell += strings.Repeat(" ", colW-vl)
+			}
+			if vl > colW {
+				cell = runewidth.Truncate(stripANSI(cell), colW, "")
+			}
+			rowParts = append(rowParts, cell)
+		}
+		treeRendered = append(treeRendered, strings.Join(rowParts, colDiv))
+	}
+
+	// ── Detail pane ───────────────────────────────────────────
+	divLine := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("─", contentW-2))
+	var detailLines []string
+	detailLines = append(detailLines, divLine)
+	if m.plotEditing {
+		fieldLabel := "Beskrivelse"
+		if m.plotEditField == "consequence" {
+			fieldLabel = "Konsekvens"
+		}
+		detailLines = append(detailLines, lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render(fieldLabel+": ")+m.campInput.View())
+	} else {
+		cur := m.plotCurrentNode()
+		if cur != nil {
+			nodeTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render(cur.Title)
+			detailLines = append(detailLines, nodeTitle)
+			if cur.Description != "" {
+				detailLines = append(detailLines, sDim.Render("Beskriv: ")+lipgloss.NewStyle().Foreground(colorBright).Render(cur.Description))
+			} else {
+				detailLines = append(detailLines, sDim.Render("(ingen beskrivelse — e=tilføj)"))
+			}
+			if cur.Consequence != "" {
+				detailLines = append(detailLines, sDim.Render("Konsekvens: ")+lipgloss.NewStyle().Foreground(colorBlue).Render(cur.Consequence))
+			} else {
+				detailLines = append(detailLines, sDim.Render("(ingen konsekvens — c=tilføj)"))
+			}
+			if cur.WikiName != "" {
+				detailLines = append(detailLines, sDim.Render("🔗 ")+lipgloss.NewStyle().Foreground(colorAccent).Underline(true).Render(cur.WikiName))
+			}
+		} else {
+			detailLines = append(detailLines, sDim.Render("Vælg en node, eller tryk 'n' for at tilføje"))
+		}
+	}
+
+	pBody := strings.Join(append(treeRendered, detailLines...), "\n")
+
+	// ── Content pane header ───────────────────────────────────
+	camp := m.campaign.Campaigns[m.plotCampIdx]
+	pContentTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render(camp.Name)
+	pContentHint := sDim.Render("[/]=skift kampagne")
+	pGap := contentW - lipgloss.Width(pContentTitle) - lipgloss.Width(pContentHint) - 4
+	if pGap < 0 {
+		pGap = 0
+	}
+	pHeader := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, false, true, false).
+		BorderForeground(colorGold).Width(contentW).Padding(0, 1).
+		Render(pContentTitle + strings.Repeat(" ", pGap) + pContentHint)
+
+	// ── Combine sidebar + content line by line ────────────────
+	dividerP := lipgloss.NewStyle().Foreground(colorGold).Render("│")
+	pSideAll := append([]string{sideHeader}, sideLines...)
+	pContAll := append([]string{pHeader}, strings.Split(pBody, "\n")...)
+	pTotalLines := vis + 1
+	for len(pSideAll) < pTotalLines {
+		pSideAll = append(pSideAll, "")
+	}
+	for len(pContAll) < pTotalLines {
+		pContAll = append(pContAll, "")
+	}
+	var pMainLines []string
+	for i := 0; i < pTotalLines; i++ {
+		sl := ""
+		if i < len(pSideAll) {
+			sl = pSideAll[i]
+		}
+		cl := ""
+		if i < len(pContAll) {
+			cl = pContAll[i]
+		}
+		vl := visLen(sl)
+		if vl < sideW {
+			pad := lipgloss.NewStyle().Background(colorSideBg).Render(strings.Repeat(" ", sideW-vl))
+			sl = sl + pad
+		}
+		pMainLines = append(pMainLines, sl+dividerP+cl)
+	}
+	return header + "\n" + strings.Join(pMainLines, "\n") + "\n" + pSearchBar
 }
 
 func (m model) viewCampaign() string {
@@ -2344,8 +3148,8 @@ func (m model) viewCampaign() string {
 
 	// Header
 	leftAccent := lipgloss.NewStyle().Background(colorGreen).Foreground(colorGreen).Render("  ")
-	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorGreen).Bold(true).Padding(0, 2).Render("⚔  KAMPAGNE")
-	modeBadge := lipgloss.NewStyle().Background(colorGreen).Foreground(colorBg).Bold(true).Render(" KAMPAGNE ")
+	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorGreen).Bold(true).Padding(0, 2).Render("⚔  KAMPAGNESTYRING")
+	modeBadge := lipgloss.NewStyle().Background(colorGreen).Foreground(colorBg).Bold(true).Render(" KAMPAGNESTYRING ")
 	right := lipgloss.NewStyle().Background(colorBg).Padding(0, 1).Render(modeBadge)
 	headerGap := m.width - lipgloss.Width(leftAccent) - lipgloss.Width(title) - lipgloss.Width(right)
 	if headerGap < 0 {
@@ -2379,9 +3183,7 @@ func (m model) viewCampaign() string {
 		} else if item != nil && item.kind == campKindSession {
 			prompt = "Omdøb session:"
 		}
-		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") +
-			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campRenameInput) + cur
+		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") + m.campInput.View()
 	} else if m.campEditing {
 		hintText = sDim.Render("Enter / Esc = gem & luk")
 	} else if m.campAdding {
@@ -2391,27 +3193,31 @@ func (m model) viewCampaign() string {
 		} else if m.campAddKind == campKindSession {
 			prompt = "Ny sessions navn:"
 		}
-		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") +
-			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campAddInput) + cur
+		hintText = lipgloss.NewStyle().Foreground(colorGold).Render(prompt+" ") + m.campInput.View()
 	} else if m.campTaskAdding {
-		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-		hintText = lipgloss.NewStyle().Foreground(colorGold).Render("Ny opgave: ") +
-			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campTaskInput) + cur
+		hintText = lipgloss.NewStyle().Foreground(colorGold).Render("Ny opgave: ") + m.campInput.View()
 	} else if m.campBlurbEditing {
-		cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-		hintText = lipgloss.NewStyle().Foreground(colorGold).Render("Blurb: ") +
-			lipgloss.NewStyle().Foreground(colorSelFg).Render(m.campBlurbInput) + cur
+		hintText = sDim.Render("Ctrl+S = gem  |  Esc = annuller")
 	} else if m.campTaskFocus {
 		hintText = sDim.Render("j/k=naviger  Space/Enter=toggle  d=slet  t=ny opgave  Esc=luk")
+	} else if m.campSearchActive {
+		queryText := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(m.campSearchQuery)
+		cursor := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
+		label := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render("SØGER ")
+		hintText = label + queryText + cursor + sDim.Render("  Esc=ryd  Enter=bekræft")
 	} else {
-		hintText = sDim.Render("Tab=verden  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  t=opgave  c=kampagne  i=initiative  b=blurb  r=omdøb  d=slet")
+		hintText = sDim.Render("Tab=artikler  /=søg  ↑↓=naviger  → Enter=åbn/fold  a=spiller  s=session  t=opgave  c=kampagne  i=initiativ  b=blurb  r=omdøb  d=slet")
+	}
+	divColorCamp := sBorderNormal
+	if m.campSearchActive {
+		divColorCamp = sBorderActive
 	}
 	searchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(hintText)
-	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(sBorderNormal)).Render(strings.Repeat("─", m.width))
-	searchBar := searchLine + "\n" + borderLine
+	borderLine := lipgloss.NewStyle().Foreground(lipgloss.Color(divColorCamp)).Render(strings.Repeat("─", m.width))
+	searchBar := borderLine + "\n" + searchLine
 
-	// Sidebar — render from campItems
+	// Sidebar — render from campItems (filtered if search active)
+	filteredItems := m.campFilteredItems()
 	sideLabel := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGreen).Bold(true).Padding(0, 1).
 		Render(fmt.Sprintf("KAMPAGNER  %d", len(m.campaign.Campaigns)))
 	sideHeader := lipgloss.NewStyle().Background(colorSideBg).
@@ -2420,10 +3226,12 @@ func (m model) viewCampaign() string {
 
 	var sideLines []string
 	maxVisible := vis - 1
-	for i, it := range m.campItems {
-		if i >= maxVisible {
-			break
-		}
+	end := m.campListOffset + maxVisible
+	if end > len(filteredItems) {
+		end = len(filteredItems)
+	}
+	for i := m.campListOffset; i < end; i++ {
+		it := filteredItems[i]
 		line := it.label
 		maxW := sideW - 2
 		if runewidth.StringWidth(line) > maxW {
@@ -2444,6 +3252,22 @@ func (m model) viewCampaign() string {
 			sideLines = append(sideLines, lipgloss.NewStyle().Background(colorSideBg).Foreground(fg).Render(line))
 		}
 	}
+	// Scroll indicators
+	if m.campListOffset > 0 {
+		indicator := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGreen).Render("  ↑ " + strings.Repeat(" ", max(0, sideW-4)))
+		sideLines = append([]string{indicator}, sideLines...)
+		if len(sideLines) > maxVisible {
+			sideLines = sideLines[:maxVisible]
+		}
+	}
+	if end < len(filteredItems) {
+		indicator := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGreen).Render("  ↓ " + strings.Repeat(" ", max(0, sideW-4)))
+		if len(sideLines) < maxVisible {
+			sideLines = append(sideLines, indicator)
+		} else {
+			sideLines[maxVisible-1] = indicator
+		}
+	}
 	for len(sideLines) < maxVisible {
 		sideLines = append(sideLines, lipgloss.NewStyle().Background(colorSideBg).Render(strings.Repeat(" ", sideW)))
 	}
@@ -2455,7 +3279,7 @@ func (m model) viewCampaign() string {
 	if m.showInitiative {
 		camp := m.campaign.Campaigns[m.initCampIdx]
 		initList := camp.Initiative
-		iTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("⚔  Initiative — " + camp.Name)
+		iTitle := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("⚔  Initiativ — " + camp.Name)
 		iHint := sDim.Render("Esc=luk")
 		iGap := contentW - lipgloss.Width(iTitle) - lipgloss.Width(iHint) - 4
 		if iGap < 0 {
@@ -2512,7 +3336,7 @@ func (m model) viewCampaign() string {
 					lipgloss.NewStyle().Foreground(colorSelFg).Render(m.initAddInput) + cur
 			} else {
 				cur := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-				initHint = lipgloss.NewStyle().Foreground(colorGold).Render("Initiative for "+m.initAddName+": ") +
+				initHint = lipgloss.NewStyle().Foreground(colorGold).Render("Initiativ for "+m.initAddName+": ") +
 					lipgloss.NewStyle().Foreground(colorSelFg).Render(m.initAddInput) + cur
 			}
 		} else {
@@ -2520,20 +3344,7 @@ func (m model) viewCampaign() string {
 		}
 		iSearchLine := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(initHint)
 		iBorderLine := lipgloss.NewStyle().Foreground(colorGold).Render(strings.Repeat("─", m.width))
-		iSearchBar := iSearchLine + "\n" + iBorderLine
-
-		// Status bar
-		var iKeys [][]string
-		if m.initAdding {
-			iKeys = [][]string{{"Enter", "bekræft"}, {"Esc", "annuller"}}
-		} else {
-			iKeys = [][]string{{"n Space", "næste tur"}, {"p", "forrige"}, {"r", "top"}, {"a", "tilføj"}, {"d", "slet"}, {"+/-", "justér"}, {"X", "ryd"}, {"Esc", "luk"}}
-		}
-		var iKeyParts []string
-		for _, k := range iKeys {
-			iKeyParts = append(iKeyParts, sKey.Render(k[0])+" "+sDim.Render(k[1]))
-		}
-		iStatusBar := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(strings.Join(iKeyParts, "  "))
+		iSearchBar := iBorderLine + "\n" + iSearchLine
 
 		// Combine sidebar + initiative content
 		dividerI := lipgloss.NewStyle().Foreground(colorGold).Render("│")
@@ -2563,7 +3374,7 @@ func (m model) viewCampaign() string {
 			}
 			iMainLines = append(iMainLines, sl+dividerI+cl)
 		}
-		return header + "\n" + iSearchBar + "\n" + strings.Join(iMainLines, "\n") + "\n" + iStatusBar
+		return header + "\n" + strings.Join(iMainLines, "\n") + "\n" + iSearchBar
 	}
 
 	item := m.campCurrentItem()
@@ -2768,10 +3579,21 @@ func (m model) viewCampaign() string {
 		parts = append(parts, "")
 		if curItem != nil && (curItem.kind == campKindPlayer || curItem.kind == campKindSession) {
 			boxW := contentW - 4
-			if blurb != "" {
-				parts = append(parts, "  "+drawCampBox("", blurb, boxW, colorMuted, colorMuted, colorBlue))
+			if m.campBlurbEditing {
+				m.campBlurbTA.SetWidth(boxW - 4)
+				editLabel := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("Blurb")
+				parts = append(parts, "  "+editLabel)
+				for _, bl := range strings.Split(m.campBlurbTA.View(), "\n") {
+					parts = append(parts, "  "+bl)
+				}
+			} else if blurb != "" {
+				for _, bl := range strings.Split(drawCampBox("Opsummering", blurb, boxW, colorMuted, colorBright, colorBlue), "\n") {
+					parts = append(parts, "  "+bl)
+				}
 			} else {
-				parts = append(parts, "  "+drawCampBox("", "(ingen blurb — tryk 'b' for at tilføje)", boxW, colorFaint, colorFaint, colorMuted))
+				for _, bl := range strings.Split(drawCampBox("Opsummering", "(ingen blurb — tryk 'b' for at tilføje)", boxW, colorFaint, colorFaint, colorMuted), "\n") {
+					parts = append(parts, "  "+bl)
+				}
 			}
 			parts = append(parts, "")
 		}
@@ -2823,28 +3645,7 @@ func (m model) viewCampaign() string {
 	}
 	main := strings.Join(mainLines, "\n")
 
-	// Status bar
-	var keys [][]string
-	if m.campConfirm {
-		keys = [][]string{{"j", "slet"}, {"n / Esc", "annuller"}}
-	} else if m.campRenaming {
-		keys = [][]string{{"Enter", "gem"}, {"Esc", "annuller"}}
-	} else if m.campEditing {
-		keys = [][]string{{"Enter", "gem & luk"}, {"Esc", "gem & luk"}}
-	} else if m.campTaskFocus {
-		keys = [][]string{{"j/k", "naviger"}, {"Space", "toggle"}, {"d", "slet"}, {"t", "ny opgave"}, {"Esc", "luk"}}
-	} else if m.campBlurbEditing || m.campTaskAdding {
-		keys = [][]string{{"Enter", "gem"}, {"Esc", "annuller"}}
-	} else {
-		keys = [][]string{{"↑↓ jk", "naviger"}, {"→ ←", "fold"}, {"Enter", "åbn/rediger"}, {"a", "spiller"}, {"s", "session"}, {"t", "opgave"}, {"b", "blurb"}, {"c", "kampagne"}, {"i", "initiative"}, {"r", "omdøb"}, {"d", "slet"}, {"Tab", "verden"}}
-	}
-	var keyParts []string
-	for _, k := range keys {
-		keyParts = append(keyParts, sKey.Render(k[0])+" "+sDim.Render(k[1]))
-	}
-	statusBar := lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(strings.Join(keyParts, "  "))
-
-	return header + "\n" + searchBar + "\n" + main + "\n" + statusBar
+	return header + "\n" + main + "\n" + searchBar
 }
 
 // visLen returns the visible display width of a string, stripping ANSI escapes
@@ -3017,9 +3818,24 @@ func (m *model) buildCampItems() {
 	m.campItems = items
 }
 
+func (m *model) campFilteredItems() []campListItem {
+	if m.campSearchQuery == "" {
+		return m.campItems
+	}
+	q := strings.ToLower(m.campSearchQuery)
+	var out []campListItem
+	for _, it := range m.campItems {
+		if strings.Contains(strings.ToLower(it.label), q) {
+			out = append(out, it)
+		}
+	}
+	return out
+}
+
 func (m *model) campCurrentItem() *campListItem {
-	if m.campCursor >= 0 && m.campCursor < len(m.campItems) {
-		return &m.campItems[m.campCursor]
+	items := m.campFilteredItems()
+	if m.campCursor >= 0 && m.campCursor < len(items) {
+		return &items[m.campCursor]
 	}
 	return nil
 }
@@ -3218,6 +4034,173 @@ func newestJSON(dir string) (string, error) {
 		return "", fmt.Errorf("ingen .json filer fundet i %s", dir)
 	}
 	return newestPath, nil
+}
+
+// ---------------------------------------------------------------------------
+// Plot / decision tree helpers
+// ---------------------------------------------------------------------------
+
+// plotNodesAtCol returns the nodes visible in the given absolute column.
+func (m *model) plotNodesAtCol(col int) []PlotNode {
+	nodes := m.campaign.Campaigns[m.plotCampIdx].Plot
+	for i := 0; i < col; i++ {
+		cur := m.plotColCursorAt(i)
+		if cur >= len(nodes) {
+			return nil
+		}
+		nodes = nodes[cur].Children
+	}
+	return nodes
+}
+
+// plotCurrentPath returns the path to the currently focused node.
+func (m *model) plotCurrentPath() []int {
+	path := make([]int, m.plotFocusCol+1)
+	for i := 0; i <= m.plotFocusCol; i++ {
+		path[i] = m.plotColCursorAt(i)
+	}
+	return path
+}
+
+// plotParentPath returns the path to the parent of nodes in the focused column.
+// For col 0, returns nil (root level).
+func (m *model) plotParentPath() []int {
+	if m.plotFocusCol == 0 {
+		return nil
+	}
+	path := make([]int, m.plotFocusCol)
+	for i := 0; i < m.plotFocusCol; i++ {
+		path[i] = m.plotColCursorAt(i)
+	}
+	return path
+}
+
+func (m *model) plotCurrentNode() *PlotNode {
+	path := m.plotCurrentPath()
+	nodes := m.campaign.Campaigns[m.plotCampIdx].Plot
+	return plotNodeAt(nodes, path)
+}
+
+func (m *model) plotColCursorAt(col int) int {
+	if col < len(m.plotColCursor) {
+		return m.plotColCursor[col]
+	}
+	return 0
+}
+
+func (m *model) plotColOffsetAt(col int) int {
+	if col < len(m.plotColOffset) {
+		return m.plotColOffset[col]
+	}
+	return 0
+}
+
+func (m *model) setPlotColCursor(col, val int) {
+	for len(m.plotColCursor) <= col {
+		m.plotColCursor = append(m.plotColCursor, 0)
+		m.plotColOffset = append(m.plotColOffset, 0)
+	}
+	m.plotColCursor[col] = val
+}
+
+func (m *model) ensurePlotCol(col int) {
+	for len(m.plotColCursor) <= col {
+		m.plotColCursor = append(m.plotColCursor, 0)
+		m.plotColOffset = append(m.plotColOffset, 0)
+	}
+}
+
+// resetPlotColsAfter resets cursor/offset for all columns after col,
+// and pulls focus back to col if it was further right.
+func (m *model) resetPlotColsAfter(col int) {
+	for i := col + 1; i < len(m.plotColCursor); i++ {
+		m.plotColCursor[i] = 0
+		m.plotColOffset[i] = 0
+	}
+	if m.plotFocusCol > col {
+		m.plotFocusCol = col
+	}
+}
+
+func plotNodeAt(nodes []PlotNode, path []int) *PlotNode {
+	if len(path) == 0 || path[0] >= len(nodes) {
+		return nil
+	}
+	n := &nodes[path[0]]
+	for _, idx := range path[1:] {
+		if idx >= len(n.Children) {
+			return nil
+		}
+		n = &n.Children[idx]
+	}
+	return n
+}
+
+// plotSetNode returns a copy of the tree with the node at path replaced.
+func (m *model) plotSetNode(nodes []PlotNode, path []int, node PlotNode) []PlotNode {
+	if len(path) == 0 {
+		return nodes
+	}
+	result := make([]PlotNode, len(nodes))
+	copy(result, nodes)
+	if path[0] >= len(result) {
+		return result
+	}
+	if len(path) == 1 {
+		result[path[0]] = node
+		return result
+	}
+	result[path[0]].Children = m.plotSetNode(result[path[0]].Children, path[1:], node)
+	return result
+}
+
+func plotDeleteAt(nodes []PlotNode, path []int) []PlotNode {
+	if len(path) == 0 || path[0] >= len(nodes) {
+		return nodes
+	}
+	if len(path) == 1 {
+		result := make([]PlotNode, 0, len(nodes)-1)
+		result = append(result, nodes[:path[0]]...)
+		result = append(result, nodes[path[0]+1:]...)
+		return result
+	}
+	result := make([]PlotNode, len(nodes))
+	copy(result, nodes)
+	result[path[0]].Children = plotDeleteAt(result[path[0]].Children, path[1:])
+	return result
+}
+
+func (m *model) plotAddChildAt(nodes []PlotNode, parentPath []int, child PlotNode) []PlotNode {
+	if len(parentPath) == 0 {
+		return append(nodes, child)
+	}
+	result := make([]PlotNode, len(nodes))
+	copy(result, nodes)
+	if parentPath[0] >= len(result) {
+		return result
+	}
+	result[parentPath[0]].Children = m.plotAddChildAt(result[parentPath[0]].Children, parentPath[1:], child)
+	return result
+}
+
+// stripANSI removes ANSI escape codes for width-safe truncation.
+func stripANSI(s string) string {
+	var out strings.Builder
+	inEsc := false
+	for _, r := range s {
+		if r == '\x1b' {
+			inEsc = true
+			continue
+		}
+		if inEsc {
+			if r == 'm' {
+				inEsc = false
+			}
+			continue
+		}
+		out.WriteRune(r)
+	}
+	return out.String()
 }
 
 func main() {
