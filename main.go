@@ -383,6 +383,7 @@ var (
 	colorGold    = lipgloss.Color("#E8B64B")
 	colorBlue    = lipgloss.Color("#7EB8CC")
 	colorGreen   = lipgloss.Color("#6DBF8A")
+	colorTeal    = lipgloss.Color("#5BC4BE")
 	colorMuted   = lipgloss.Color("#5C6478")
 	colorFaint   = lipgloss.Color("#252C3E")
 	colorBright  = lipgloss.Color("#DCE4F0")
@@ -616,7 +617,6 @@ type focus int
 const (
 	focusList focus = iota
 	focusSearch
-	focusContent
 )
 
 type viewMode int
@@ -1800,13 +1800,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.campAdding = false
 				m.campInput.Blur()
 				m.mode = plotView
-				m.plotCampIdx = 0
-				m.plotSideCursor = 0
-				m.plotSideFocus = false
-				m.plotFocusCol = 0
-				m.plotViewStart = 0
-				m.plotColCursor = []int{0}
-				m.plotColOffset = []int{0}
 				return m, tea.Batch(cmds...)
 			case "esc":
 				if m.mode == plotView {
@@ -2037,17 +2030,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			}
-			if m.focus == focusContent {
-				if m.showMentions {
-					m.showMentions = false
-				} else {
-					m.focus = focusList
-				}
-				return m, nil
-			}
-		case "enter":
-			if m.focus == focusContent && !m.showMentions {
-				m.focus = focusList
+			if m.showMentions {
+				m.showMentions = false
 				return m, nil
 			}
 		case "ctrl+left":
@@ -2075,13 +2059,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.campAdding = false
 				m.campInput.Blur()
 				m.mode = plotView
-				m.plotCampIdx = 0
-				m.plotSideCursor = 0
-				m.plotSideFocus = false
-				m.plotFocusCol = 0
-				m.plotViewStart = 0
-				m.plotColCursor = []int{0}
-				m.plotColOffset = []int{0}
 			default:
 				m.campInput.Blur()
 				m.mode = worldView
@@ -2093,7 +2070,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.showMentions {
 					m.mentionCursor = 0
 					m.mentionInput = ""
-					m.focus = focusContent
+				}
+			}
+			return m, nil
+		}
+
+		// Mentions overlay keys (active regardless of focus)
+		if m.showMentions {
+			switch msg.String() {
+			case "esc":
+				if m.mentionInput != "" {
+					m.mentionInput = ""
+				} else {
+					m.showMentions = false
+				}
+			case "enter":
+				if m.mentionInput != "" {
+					idx := 0
+					fmt.Sscanf(m.mentionInput, "%d", &idx)
+					idx--
+					if idx >= 0 && idx < len(m.mentions) {
+						m.mentionInput = ""
+						m.jumpToMention(m.mentions[idx].resource)
+					} else {
+						m.mentionInput = ""
+					}
+				} else {
+					m.showMentions = false
+				}
+			case "backspace":
+				if len(m.mentionInput) > 0 {
+					m.mentionInput = m.mentionInput[:len(m.mentionInput)-1]
+				}
+			case "up", "k":
+				if m.mentionInput == "" && m.mentionCursor > 0 {
+					m.mentionCursor--
+				}
+			case "down", "j":
+				if m.mentionInput == "" && m.mentionCursor < len(m.mentions)-1 {
+					m.mentionCursor++
+				}
+			default:
+				if len(msg.Runes) == 1 && msg.Runes[0] >= '0' && msg.Runes[0] <= '9' {
+					m.mentionInput += string(msg.Runes[0])
 				}
 			}
 			return m, nil
@@ -2107,18 +2126,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if m.cursor > 0 {
 					m.cursor--
 					m.clampOffset()
+					m.selectCurrent()
 				}
 			case "down", "j":
 				if m.cursor < len(m.items)-1 {
 					m.cursor++
 					m.clampOffset()
+					m.selectCurrent()
 				}
 			case "g":
 				m.cursor = 0
 				m.listOffset = 0
+				m.selectCurrent()
 			case "G":
 				m.cursor = len(m.items) - 1
 				m.clampOffset()
+				m.selectCurrent()
+			case "ctrl+d", "pgdown":
+				m.vp.HalfViewDown()
+				return m, nil
+			case "ctrl+u", "pgup":
+				m.vp.HalfViewUp()
+				return m, nil
 			case "enter":
 				m.selectCurrent()
 			case "right", "l":
@@ -2172,55 +2201,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case focusContent:
-			if m.showMentions {
-				switch msg.String() {
-				case "esc":
-					if m.mentionInput != "" {
-						m.mentionInput = ""
-					} else {
-						m.showMentions = false
-					}
-				case "enter":
-					if m.mentionInput != "" {
-						idx := 0
-						fmt.Sscanf(m.mentionInput, "%d", &idx)
-						idx--
-						if idx >= 0 && idx < len(m.mentions) {
-							m.mentionInput = ""
-							m.jumpToMention(m.mentions[idx].resource)
-						} else {
-							m.mentionInput = ""
-						}
-					} else {
-						m.showMentions = false
-					}
-				case "backspace":
-					if len(m.mentionInput) > 0 {
-						m.mentionInput = m.mentionInput[:len(m.mentionInput)-1]
-					}
-				case "up", "k":
-					if m.mentionInput == "" && m.mentionCursor > 0 {
-						m.mentionCursor--
-					}
-				case "down", "j":
-					if m.mentionInput == "" && m.mentionCursor < len(m.mentions)-1 {
-						m.mentionCursor++
-					}
-				default:
-					if len(msg.Runes) == 1 && msg.Runes[0] >= '0' && msg.Runes[0] <= '9' {
-						m.mentionInput += string(msg.Runes[0])
-					}
-				}
-			} else {
-				switch msg.String() {
-				default:
-					var cmd tea.Cmd
-					m.vp, cmd = m.vp.Update(msg)
-					cmds = append(cmds, cmd)
-				}
-			}
-
 		}
 	}
 
@@ -2239,8 +2219,35 @@ func (m *model) sidebarWidth() int {
 }
 
 func (m *model) visibleLines() int {
-	// header(1) + borderLine(1) + searchLine(1) + sideHeader w/ bottom border(2) = 5 overhead
-	return m.height - 5
+	// header(1) + tabBar(1) + borderLine(1) + searchLine(1) + sideHeader w/ bottom border(2) = 6 overhead
+	return m.height - 6
+}
+
+func (m model) renderTabBar() string {
+	type tab struct {
+		label string
+		mode  viewMode
+		color lipgloss.Color
+	}
+	tabs := []tab{
+		{"  Wiki  ", worldView, colorTeal},
+		{"  Kampagner  ", campaignView, colorGreen},
+		{"  Plottråde  ", plotView, colorGold},
+	}
+	var parts []string
+	for _, t := range tabs {
+		if t.mode == m.mode {
+			parts = append(parts, lipgloss.NewStyle().
+				Background(t.color).Foreground(colorBg).Bold(true).
+				Render(t.label))
+		} else {
+			parts = append(parts, lipgloss.NewStyle().
+				Background(colorFaint).Foreground(colorMuted).
+				Render(t.label))
+		}
+	}
+	bar := strings.Join(parts, lipgloss.NewStyle().Background(colorBg).Render(" "))
+	return lipgloss.NewStyle().Background(colorBg).Width(m.width).Padding(0, 1).Render(bar)
 }
 
 func (m *model) clampOffset() {
@@ -2339,7 +2346,6 @@ func (m *model) loadContent(r *Resource) {
 	contentWidth := m.width - m.sidebarWidth() - 4
 	m.vp.SetContent(styleContent(m.wrapContent(m.content, contentWidth)))
 	m.vp.GotoTop()
-	m.focus = focusContent
 	seen := map[string]bool{}
 	m.mentions = nil
 	m.showMentions = false
@@ -2478,28 +2484,26 @@ func (m model) View() string {
 	vis := m.visibleLines()
 
 	// ── Header ────────────────────────────────────────────────
-	leftAccent := lipgloss.NewStyle().Background(colorGold).Foreground(colorGold).Render("  ")
+	leftAccent := lipgloss.NewStyle().Background(colorTeal).Foreground(colorTeal).Render("  ")
 	title := lipgloss.NewStyle().
 		Background(colorBg).
 		Foreground(colorSelFg).
 		Bold(true).
 		Padding(0, 2).
-		Render("⚔  ARTIKLER")
+		Render("⚔  WIKI")
 
 	var modeLabel string
 	var modeBg, modeFg lipgloss.Color
 	switch m.focus {
 	case focusSearch:
 		modeLabel, modeBg, modeFg = " SØGER ", colorAccent, colorBg
-	case focusContent:
+	default:
 		if m.showMentions {
 			modeLabel, modeBg, modeFg = " LINKS ", colorSelBg, colorSelFg
-		} else {
-			modeLabel, modeBg, modeFg = " LÆSER ", colorSelBg, colorSelFg
-		}
-	default:
-		if m.searchQuery != "" {
+		} else if m.searchQuery != "" {
 			modeLabel, modeBg, modeFg = " FILTER ", colorFaint, colorBlue
+		} else if m.selected != nil {
+			modeLabel, modeBg, modeFg = " LÆSER ", colorSelBg, colorSelFg
 		} else {
 			modeLabel, modeBg, modeFg = " LISTE ", colorFaint, colorMuted
 		}
@@ -2522,10 +2526,10 @@ func (m model) View() string {
 		headerGap = 0
 	}
 	header := leftAccent + title + strings.Repeat(" ", headerGap) + right
-	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header)
+	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header) + "\n" + m.renderTabBar()
 
 	// ── Search bar ────────────────────────────────────────────
-	divColor := sBorderNormal
+	divColor := colorTeal
 	if m.focus == focusSearch {
 		divColor = sBorderActive
 	}
@@ -2534,13 +2538,13 @@ func (m model) View() string {
 	if m.focus == focusSearch {
 		queryText := lipgloss.NewStyle().Foreground(colorSelFg).Bold(true).Render(m.searchQuery)
 		cursor := lipgloss.NewStyle().Background(colorSelFg).Foreground(colorBg).Render(" ")
-		label := lipgloss.NewStyle().Foreground(colorGold).Bold(true).Render("SØGER ")
+		label := lipgloss.NewStyle().Foreground(colorTeal).Bold(true).Render("SØGER ")
 		searchContent = label + queryText + cursor
 	} else if m.searchQuery != "" {
 		label := lipgloss.NewStyle().Foreground(colorMuted).Render("/ ")
 		searchContent = label + lipgloss.NewStyle().Foreground(colorBright).Render(m.searchQuery)
 	} else {
-		searchContent = sDim.Render("/  søg... (#tag for tag-filter)")
+		searchContent = sDim.Render("/  søg...  (#tag for tag-filter)  Ctrl+D/U=scroll indhold")
 	}
 	if m.notification != "" {
 		notif := lipgloss.NewStyle().Foreground(colorGreen).Bold(true).Render(m.notification)
@@ -2555,16 +2559,13 @@ func (m model) View() string {
 	searchBar := borderLine + "\n" + searchLine
 
 	// ── Sidebar items ─────────────────────────────────────────
-	listBorderColor := sBorderNormal
-	if m.focus == focusList {
-		listBorderColor = sBorderActive
-	}
+	listBorderColor := colorTeal
 
 	var sideLabelText string
 	if m.searchQuery != "" {
 		sideLabelText = fmt.Sprintf("SØGER  %d", len(m.items))
 	} else {
-		sideLabelText = fmt.Sprintf("ARTIKLER  %d", len(m.resources))
+		sideLabelText = fmt.Sprintf("WIKI  %d", len(m.resources))
 	}
 	sideLabel := lipgloss.NewStyle().
 		Background(colorSideBg).
@@ -2637,10 +2638,7 @@ func (m model) View() string {
 	}
 
 	// ── Content pane ──────────────────────────────────────────
-	contentBorderColor := sBorderNormal
-	if m.focus == focusContent {
-		contentBorderColor = sBorderActive
-	}
+	contentBorderColor := colorTeal
 	contentW := m.width - sideW - 1
 
 	var contentHeader string
@@ -2770,16 +2768,16 @@ func (m model) viewHelp() string {
 		keys [][]string
 	}
 	sections := []section{
-		{"Artikler", [][]string{
+		{"Wiki", [][]string{
 			{"/", "søg (skriv for at filtrere)"},
 			{"↑↓  jk", "naviger liste"},
 			{"→  ←", "fold ud / fold ind"},
 			{"Enter", "åbn artikel"},
 			{"Ctrl+← →", "historik frem/tilbage"},
 			{"f", "vis henvisninger"},
-			{"Tab", "gå til Kampagnestyring"},
+			{"Tab", "gå til Kampagner"},
 		}},
-		{"Kampagnestyring", [][]string{
+		{"Kampagner", [][]string{
 			{"/", "søg kampagner/spillere/sessioner"},
 			{"↑↓  jk", "naviger"},
 			{"→  Enter", "åbn / fold ud"},
@@ -2806,7 +2804,7 @@ func (m model) viewHelp() string {
 			{"c", "rediger konsekvens"},
 			{"Ctrl+R", "tilknyt wiki-artikel"},
 			{"d", "slet node"},
-			{"Tab", "gå til Artikler"},
+			{"Tab", "gå til Wiki"},
 		}},
 		{"Generelt", [][]string{
 			{"Tab", "skift mellem de tre views"},
@@ -2859,7 +2857,7 @@ func (m model) viewPlot() string {
 		headerGap = 0
 	}
 	header := leftAccent + title + strings.Repeat(" ", headerGap) + right
-	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header)
+	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header) + "\n" + m.renderTabBar()
 
 	// ── Sidebar: campaign list ────────────────────────────────
 	sideLabel := lipgloss.NewStyle().Background(colorSideBg).Foreground(colorGold).Bold(true).Padding(0, 1).
@@ -3148,15 +3146,15 @@ func (m model) viewCampaign() string {
 
 	// Header
 	leftAccent := lipgloss.NewStyle().Background(colorGreen).Foreground(colorGreen).Render("  ")
-	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorGreen).Bold(true).Padding(0, 2).Render("⚔  KAMPAGNESTYRING")
-	modeBadge := lipgloss.NewStyle().Background(colorGreen).Foreground(colorBg).Bold(true).Render(" KAMPAGNESTYRING ")
+	title := lipgloss.NewStyle().Background(colorBg).Foreground(colorGreen).Bold(true).Padding(0, 2).Render("⚔  KAMPAGNER")
+	modeBadge := lipgloss.NewStyle().Background(colorGreen).Foreground(colorBg).Bold(true).Render(" KAMPAGNER ")
 	right := lipgloss.NewStyle().Background(colorBg).Padding(0, 1).Render(modeBadge)
 	headerGap := m.width - lipgloss.Width(leftAccent) - lipgloss.Width(title) - lipgloss.Width(right)
 	if headerGap < 0 {
 		headerGap = 0
 	}
 	header := leftAccent + title + strings.Repeat(" ", headerGap) + right
-	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header)
+	header = lipgloss.NewStyle().Background(colorBg).Width(m.width).Render(header) + "\n" + m.renderTabBar()
 
 	// Hint bar
 	var hintText string
@@ -4208,9 +4206,18 @@ func main() {
 		dataPath = os.Args[1]
 	} else {
 		home, _ := os.UserHomeDir()
-		path, err := newestJSON(filepath.Join(home, "Hentet"))
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Angiv en fil: aelden <fil.json>\n(%v)\n", err)
+		candidates := []string{"Hentet", "Downloads", "Dokumenter", "Documents", "Desktop", "Skrivebord"}
+		var lastErr error
+		var path string
+		for _, dir := range candidates {
+			path, lastErr = newestJSON(filepath.Join(home, dir))
+			if lastErr == nil {
+				break
+			}
+		}
+		if path == "" {
+			fmt.Fprintf(os.Stderr, "Angiv en fil: aelden <fil.json>\nSøgte i: %s\n(%v)\n",
+				strings.Join(candidates, ", "), lastErr)
 			os.Exit(1)
 		}
 		dataPath = path
