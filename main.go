@@ -3381,9 +3381,9 @@ func (m model) viewCampaign() string {
 	if item != nil {
 		switch item.kind {
 		case campKindCampaign:
-			nbTitle = "⚔  " + m.campaign.Campaigns[item.campIdx].Name
+			nbTitle = m.campaign.Campaigns[item.campIdx].Name
 		case campKindGeneral:
-			nbTitle = "📋  " + m.campaign.Campaigns[item.campIdx].Name + " — Generelt"
+			nbTitle = m.campaign.Campaigns[item.campIdx].Name + " — Generelt"
 			canEdit = true
 		case campKindPlayer:
 			nbTitle = "👤  " + m.campaign.Campaigns[item.campIdx].Players[item.playerIdx].Name
@@ -3792,23 +3792,23 @@ func (m *model) buildCampItems() {
 		}
 		items = append(items, campListItem{
 			kind: campKindCampaign, campIdx: i,
-			label: foldIcon + "⚔  " + c.Name, depth: 0,
+			label: foldIcon + c.Name, depth: 0,
 		})
 		if m.campExpanded[i] {
 			items = append(items, campListItem{
 				kind: campKindGeneral, campIdx: i,
-				label: "  📋  Generelt", depth: 1,
+				label: "  Generelt", depth: 1,
 			})
 			for j, p := range c.Players {
 				items = append(items, campListItem{
 					kind: campKindPlayer, campIdx: i, playerIdx: j,
-					label: "  👤  " + p.Name, depth: 1,
+						label: "  👤  " + p.Name, depth: 1,
 				})
 			}
 			for k, s := range c.Sessions {
 				items = append(items, campListItem{
 					kind: campKindSession, campIdx: i, playerIdx: k,
-					label: "  📅  " + s.Name, depth: 1,
+						label: "  📅  " + s.Name, depth: 1,
 				})
 			}
 		}
